@@ -1,17 +1,20 @@
-# SONICPUSH AI — Firestore Security Specification (Phase 1 Hardened)
+# SONICPUSH AI — Firestore & Storage Security Specification (Phase 2 Production Hardened)
 
 ## 1. Data Invariants
 1. **Verified Identity**: All database writes and reads require `request.auth != null` and `request.auth.token.email_verified == true` (except `test/connection` health probe).
-2. **No Self-Escalation & Custom Claim Governance**: A user creating `users/{uid}` may only choose `ARTIST` or `PROMOTER` unless holding a verified `superAdmin == true` custom claim or matching the bootstrap owner account. Only an existing `SUPER_ADMIN` can grant or revoke roles, and the bootstrap owner cannot be deleted or locked out.
-3. **Organization Membership Gate**: Every tenant-scoped document creation validates that `incoming().organizationId` exists in `/organizations/{orgId}` and `request.auth.uid` is the org owner or in `assignedUserIds`.
-4. **Immutable Ownership & Tenant Scope**: `ownerId`, `organizationId`, and `createdAt` cannot be modified after creation, and `ownerId` must always remain in `assignedUserIds`.
-5. **Server Timestamps**: `createdAt == request.time` on creation and `updatedAt == request.time` on updates.
-6. **Organization & Assignment Isolation**: `list` queries never delegate filtering to the client; rules enforce `resource.data.ownerId == request.auth.uid || request.auth.uid in resource.data.assignedUserIds || hasAdminPrivilege()`.
-7. **Financial & Audit Immutability**:
+2. **No Self-Escalation & Custom Claim Governance**: A user creating `users/{uid}` may only choose `ARTIST` or `PROMOTER` unless holding a verified `superAdmin == true` / `role == 'SUPER_ADMIN'` custom claim or matching the bootstrap owner account. Only an existing `SUPER_ADMIN` can grant or revoke roles via `/api/admin/users/:targetUid/role`, which updates `users/{uid}.role`, synchronizes Firebase Auth custom claims (`superAdmin: true, role: 'SUPER_ADMIN'`), writes `admin_audit_logs`, and flags `needsTokenRefresh` so clients refresh their JWT immediately. Bootstrap owner (`emma432cent@gmail.com`) and caller self-demotion are blocked.
+3. **Promoted Super Admin Parity**: Both bootstrap and promoted `SUPER_ADMIN` accounts holding synced custom claims pass `hasAdminListAccess()`, `isSuperAdmin()`, and `storage.rules` checks for platform-wide `get`, `list`, reconciliation, and audio governance.
+4. **Organization Membership Gate**: Every tenant-scoped document creation validates that `incoming().organizationId` exists in `/organizations/{orgId}` and `request.auth.uid` is the org owner or in `assignedUserIds`.
+5. **Immutable Ownership & Tenant Scope**: `ownerId`, `organizationId`, and `createdAt` cannot be modified after creation, and `ownerId` must always remain in `assignedUserIds`.
+6. **Server Timestamps**: `createdAt == request.time` on creation and `updatedAt == request.time` on updates for client-created/mutable documents.
+7. **Organization & Assignment Isolation**: `list` queries never delegate filtering to the client; rules enforce `resource.data.ownerId == request.auth.uid || request.auth.uid in resource.data.assignedUserIds || hasAdminListAccess()`.
+8. **Server-Managed Payment Infrastructure & Immutability**:
+   - `payment_reference_bindings`, `payment_webhook_events`, `ai_rate_limits`, and `audio_cleanup_logs` forbid all client creates, updates, and deletes (`allow create, update, delete: if false`); only server-side Firebase Admin SDK transactions write authoritative verification, uniqueness bindings, webhook idempotency/retry state, and AI quota counters.
+   - `payment_reference_bindings`, `payment_webhook_events`, and `audio_cleanup_logs` are readable (`get`/`list`) only by `SUPER_ADMIN`. `ai_rate_limits` is completely inaccessible to clients.
    - `payments` must reference an existing `invoice` in the same `organizationId` with matching `amount` and `currency`, and clients can only create `pending` or `awaiting_provider_integration` states (never `verified`, `refunded`, or `disputed`).
    - Paid, void, refunded, or disputed invoices cannot be modified by non-admins; non-admins can never change `amount`/`currency` on issued invoices or set `status == 'paid'`.
    - `payments`, `invoices`, `ai_usage_logs`, `outreach_history`, and `admin_audit_logs` have `allow delete: if false` so financial and audit trails cannot be erased.
-8. **Role Boundaries & Private Catalogs**: Only `PROMOTER` or `SUPER_ADMIN` can create/modify/delete agency `clients`. Only `SUPER_ADMIN` can create/modify/delete `service_packages`, and non-public packages (`isPublic == false`) cannot be read by non-admins.
+9. **Private Storage & Retention Lifecycle**: Uploaded audio files in Firebase Storage remain strictly private under `/organizations/{orgId}/audio/{uuid}.{ext}`. Clients obtain temporary signed URLs or authorized proxy streams only after server verification of song organization/assignment membership, and expired files (`audioRetentionExpiresAt`) are purged by `AudioRetentionService` with `audioStorageCleanupStatus` (`active` -> `deleted` / `cleanup_failed`).
 
 ## 2. Adversarial Security Test Vectors
 1. **Anonymous Access**: Unauthenticated read/write on any user/tenant collection -> `PERMISSION_DENIED`.
@@ -19,6 +22,6 @@
 3. **Promoter Access**: Promoter manages own agency workspace (`artists`, `clients`, `campaigns`), denied from `service_packages` or another agency's docs -> `PERMISSION_DENIED` cross-scope.
 4. **Organization Isolation**: User A in Org A attempting to read/update Org B document OR create a document tagged `organizationId: orgB` -> `PERMISSION_DENIED` (`isOrgMember`).
 5. **Unauthorized Role Escalation**: Creating `/users/attackerUid` with `role: "SUPER_ADMIN"`, updating own `/users/uid` changing `role` to `"SUPER_ADMIN"` or `"PROMOTER"`, or injecting `organizationId` -> `PERMISSION_DENIED`.
-6. **Unauthorized Payment Updates**: Non-admin creating `/payments/p1` with `verificationStatus: "verified"`, mismatched invoice amount/currency, cross-org `invoiceId`, updating any payment, or deleting a payment -> `PERMISSION_DENIED`.
+6. **Unauthorized Payment Updates**: Non-admin creating `/payments/p1` with `verificationStatus: "verified"`, mismatched invoice amount/currency, cross-org `invoiceId`, updating any payment, writing `payment_reference_bindings`/`payment_webhook_events`/`ai_rate_limits`/`audio_cleanup_logs`, or deleting a payment -> `PERMISSION_DENIED`.
 7. **Unauthorized Invoice Modification**: Non-admin updating `/invoices/inv1` to `status: "paid"`, changing `amount`/`currency`, mutating a `paid`/`void` invoice, or deleting an invoice -> `PERMISSION_DENIED`.
-8. **Authorized Administrator Operations**: Bootstrap Super Admin and promoted Super Admin (`superAdmin` claim / role) can govern users, configure `service_packages`, reconcile verified payments/invoices, and write `admin_audit_logs` -> `ALLOWED`.
+8. **Promoted & Bootstrap Super Admin Parity**: Both bootstrap Super Admin and a promoted Super Admin (`superAdmin: true, role: 'SUPER_ADMIN'`) can govern users, list cross-org records, configure `service_packages`, reconcile verified payments/invoices, read `payment_webhook_events`/`payment_reference_bindings`/`audio_cleanup_logs`, and write `admin_audit_logs` -> `ALLOWED`.

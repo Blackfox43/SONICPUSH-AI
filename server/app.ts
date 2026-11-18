@@ -1,11 +1,16 @@
+import crypto from 'crypto';
 import express, { type Express, type NextFunction, type Request, type Response } from 'express';
 import multer from 'multer';
+import Stripe from 'stripe';
 import { GoogleGenAI, Type } from '@google/genai';
 import {
   createAuthMiddleware,
+  createFirebaseAdminClaimManager,
   requireRole,
   resolveServerSession,
+  syncRoleCustomClaims,
   verifyFirebaseIdToken,
+  type AuthClaimManager,
   type AuthenticatedRequest,
   type SessionResolverFn,
   type TokenVerifierFn,
@@ -18,6 +23,19 @@ import {
   runFirestoreQuery,
 } from './firestoreRest.ts';
 import {
+  createFirebaseAdminDbAdapter,
+  inspectFirebaseAdminHealth,
+  isPermissionOrCredentialError,
+  SERVER_TIMESTAMP_SENTINEL,
+  type AdminFirestoreAdapter,
+  type FirebaseAdminDiagnostics,
+} from './firebaseAdmin.ts';
+import {
+  AudioRetentionService,
+  createFirebaseAdminAudioStorage,
+  type AudioStorageAdapter,
+} from './audioStorage.ts';
+import {
   generateSafeAudioStorageDescriptor,
   MAX_AUDIO_SIZE_BYTES,
   validateAudioUpload,
@@ -29,36 +47,45 @@ import {
   validateAssistantMessages,
   wrapUntrustedBlock,
 } from './aiSecurity.ts';
-import { SlidingWindowQuotaLimiter } from './rateLimit.ts';
+import {
+  FirestoreDistributedQuotaLimiter,
+  type AiFeatureName,
+} from './rateLimit.ts';
 import {
   constructVerifiedStripeWebhookEvent,
   normalizeFlutterwaveWebhookPayload,
   normalizePaystackWebhookPayload,
   normalizeStripeWebhookEvent,
-  PaymentLedgerStore,
-  signPaymentAttestation,
-  toMinorUnits,
+  timingSafeEqualStr,
   verifyFlutterwaveWebhookSignature,
-  verifyFlutterwaveWithProvider,
   verifyPaystackWebhookSignature,
-  verifyPaystackWithProvider,
-  verifyStripeWithProvider,
   type CurrencyCode,
   type FetchLike,
   type PaymentProvider,
 } from './payments.ts';
+import {
+  FirestorePaymentRepository,
+  ReferenceConflictError,
+} from './paymentLedger.ts';
+import { logStructured, sanitizeErrorMessage } from './logger.ts';
 
 export interface SonicPushAppDeps {
   tokenVerifier?: TokenVerifierFn;
   sessionResolver?: SessionResolverFn;
-  rateLimiter?: SlidingWindowQuotaLimiter;
-  paymentLedger?: PaymentLedgerStore;
+  adminDb?: AdminFirestoreAdapter;
+  adminAuth?: AuthClaimManager;
+  audioStorage?: AudioStorageAdapter;
+  rateLimiter?: FirestoreDistributedQuotaLimiter;
+  paymentRepository?: FirestorePaymentRepository;
+  audioRetentionService?: AudioRetentionService;
   fetchImpl?: FetchLike;
+  stripeClient?: Stripe;
   getDoc?: typeof getFirestoreDoc;
   runQuery?: typeof runFirestoreQuery;
   patchDoc?: typeof patchFirestoreDoc;
   fetchWorkspaceContext?: typeof fetchAuthorizedWorkspaceContext;
   getGeminiClient?: () => GoogleGenAI;
+  getAdminDiagnosticsFn?: () => Promise<FirebaseAdminDiagnostics>;
 }
 
 function defaultGetGeminiClient(): GoogleGenAI {
@@ -76,24 +103,45 @@ function defaultGetGeminiClient(): GoogleGenAI {
   });
 }
 
-function logSecurityEvent(event: string, meta: Record<string, string | number | boolean>): void {
-  // Never log tokens, lyrics, emails, or provider secrets
-  console.info(JSON.stringify({ ts: new Date().toISOString(), event, ...meta }));
-}
-
 export function createSonicPushApp(deps: SonicPushAppDeps = {}): Express {
   const app = express();
+  const adminDb = deps.adminDb ?? createFirebaseAdminDbAdapter();
+  const adminAuth = deps.adminAuth ?? createFirebaseAdminClaimManager();
+  const audioStorage = deps.audioStorage ?? createFirebaseAdminAudioStorage();
+
+  const defaultResolver: SessionResolverFn = (identity, idToken) =>
+    resolveServerSession(identity, idToken, { adminDb });
+
   const verifyFirebaseAuth = createAuthMiddleware(
     deps.tokenVerifier ?? verifyFirebaseIdToken,
-    deps.sessionResolver ?? resolveServerSession
+    deps.sessionResolver ?? defaultResolver
   );
-  const rateLimiter = deps.rateLimiter ?? new SlidingWindowQuotaLimiter();
-  const ledger = deps.paymentLedger ?? new PaymentLedgerStore();
+
+  const allowStarterFallback =
+    process.env.ALLOW_STARTER_TIER_LIMITER_FALLBACK !== 'false' &&
+    process.env.NODE_ENV !== 'test';
+
+  const rateLimiter =
+    deps.rateLimiter ??
+    new FirestoreDistributedQuotaLimiter(adminDb, {
+      allowStarterTierFallback: deps.adminDb ? false : allowStarterFallback,
+    });
+
+  const paymentRepo =
+    deps.paymentRepository ??
+    new FirestorePaymentRepository(adminDb, {
+      fetchImpl: deps.fetchImpl,
+      stripeClient: deps.stripeClient,
+    });
+
+  const audioRetention =
+    deps.audioRetentionService ?? new AudioRetentionService(adminDb, audioStorage);
+
   const getDoc = deps.getDoc ?? getFirestoreDoc;
-  const runQuery = deps.runQuery ?? runFirestoreQuery;
   const patchDoc = deps.patchDoc ?? patchFirestoreDoc;
   const fetchContext = deps.fetchWorkspaceContext ?? fetchAuthorizedWorkspaceContext;
   const getAiClient = deps.getGeminiClient ?? defaultGetGeminiClient;
+  const getAdminDiag = deps.getAdminDiagnosticsFn ?? inspectFirebaseAdminHealth;
 
   // Capture rawBody buffer for webhook HMAC signature verification before JSON parsing
   app.use(
@@ -110,24 +158,48 @@ export function createSonicPushApp(deps: SonicPushAppDeps = {}): Express {
     limits: { fileSize: MAX_AUDIO_SIZE_BYTES, files: 1 },
   });
 
-  function aiQuotaMiddleware(req: AuthenticatedRequest, res: Response, next: NextFunction): void {
-    const uid = req.authSession?.uid;
-    if (!uid) {
-      res.status(401).json({ error: 'Authentication required.' });
-      return;
-    }
-    const decision = rateLimiter.checkAndConsume(uid);
-    res.setHeader('X-RateLimit-Limit', String(decision.limit));
-    res.setHeader('X-RateLimit-Remaining', String(decision.remaining));
-    if (!decision.allowed) {
-      res.setHeader('Retry-After', String(decision.retryAfterSeconds));
-      res.status(429).json({
-        error: decision.reason || 'Rate limit exceeded. Please retry shortly.',
-        retryAfterSeconds: decision.retryAfterSeconds,
-      });
-      return;
-    }
-    next();
+  function aiQuotaMiddleware(feature: AiFeatureName) {
+    return async (
+      req: AuthenticatedRequest,
+      res: Response,
+      next: NextFunction
+    ): Promise<void> => {
+      const session = req.authSession;
+      if (!session?.uid) {
+        res.status(401).json({ error: 'Authentication required.' });
+        return;
+      }
+
+      try {
+        const decision = await rateLimiter.checkAndConsume({
+          uid: session.uid,
+          organizationId: session.organizationId || session.uid,
+          feature,
+        });
+        res.setHeader('X-RateLimit-Limit', String(decision.limit));
+        res.setHeader('X-RateLimit-Remaining', String(decision.remaining));
+        res.setHeader('X-RateLimit-Mode', decision.mode);
+
+        if (!decision.allowed) {
+          res.setHeader('Retry-After', String(decision.retryAfterSeconds));
+          res.status(429).json({
+            error: decision.reason || 'Rate limit exceeded. Please retry shortly.',
+            retryAfterSeconds: decision.retryAfterSeconds,
+            scope: decision.scope,
+          });
+          return;
+        }
+        next();
+      } catch (err) {
+        logStructured('error', 'ai_quota_check_failed', {
+          feature,
+          error: sanitizeErrorMessage(err),
+        });
+        res.status(503).json({
+          error: 'AI quota enforcement store is temporarily unavailable. Please retry.',
+        });
+      }
+    };
   }
 
   function handleAudioUploadMiddleware(req: Request, res: Response, next: NextFunction): void {
@@ -149,17 +221,45 @@ export function createSonicPushApp(deps: SonicPushAppDeps = {}): Express {
   }
 
   // ---------------------------------------------------------------------------
-  // Health Check
+  // Health Check (Never Exposes Secrets or Tokens)
   // ---------------------------------------------------------------------------
-  app.get('/api/health', (_req: Request, res: Response) => {
-    res.json({ ok: true, service: 'SONICPUSH AI', timestamp: new Date().toISOString() });
+  app.get('/api/health', async (_req: Request, res: Response) => {
+    const adminDiag = await getAdminDiag().catch(() => null);
+    const limiterDiag = rateLimiter.getDiagnostics();
+    const geminiConfigured = Boolean(process.env.GEMINI_API_KEY);
+    const degraded =
+      !geminiConfigured ||
+      !adminDiag?.firestoreReady ||
+      limiterDiag.mode === 'starter_tier_degraded';
+
+    res.json({
+      ok: true,
+      status: degraded ? 'degraded' : 'ready',
+      service: 'SONICPUSH AI',
+      timestamp: new Date().toISOString(),
+      checks: {
+        server: true,
+        geminiConfigured,
+        firebaseAdminInitialized: Boolean(adminDiag?.initialized),
+        firestoreReady: Boolean(adminDiag?.firestoreReady),
+        storageReady: Boolean(adminDiag?.storageReady),
+        rateLimiterMode: limiterDiag.mode,
+      },
+    });
   });
 
   // ---------------------------------------------------------------------------
-  // Auth Session & Super Admin Governance (No Client Email Trust)
+  // Auth Session & Super Admin Governance (Custom Claims Sync + No Client Email Trust)
   // ---------------------------------------------------------------------------
-  app.get('/api/auth/session', verifyFirebaseAuth, (req: AuthenticatedRequest, res: Response) => {
+  app.get('/api/auth/session', verifyFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
     const s = req.authSession!;
+    let claimsSynced = !s.needsTokenRefresh;
+
+    if (s.isSuperAdmin && s.needsTokenRefresh) {
+      const syncResult = await syncRoleCustomClaims(s.uid, 'SUPER_ADMIN', adminAuth);
+      claimsSynced = syncResult.synced;
+    }
+
     res.json({
       uid: s.uid,
       email: s.email,
@@ -167,9 +267,24 @@ export function createSonicPushApp(deps: SonicPushAppDeps = {}): Express {
       role: s.role,
       isSuperAdmin: s.isSuperAdmin,
       isBootstrapAdmin: s.isBootstrapAdmin,
+      needsTokenRefresh: Boolean(s.needsTokenRefresh && claimsSynced),
+      claimsSynced,
       onboardingCompleted: s.onboardingCompleted,
       organizationId: s.organizationId,
       capabilities: s.capabilities,
+    });
+  });
+
+  app.post('/api/auth/refresh-claims', verifyFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
+    const s = req.authSession!;
+    const targetRole: UserRole = s.role || 'ARTIST';
+    const syncResult = await syncRoleCustomClaims(s.uid, targetRole, adminAuth);
+    res.json({
+      ok: syncResult.synced,
+      role: targetRole,
+      isSuperAdmin: s.isSuperAdmin,
+      claimsSynced: syncResult.synced,
+      note: syncResult.reason,
     });
   });
 
@@ -188,14 +303,15 @@ export function createSonicPushApp(deps: SonicPushAppDeps = {}): Express {
         return;
       }
       if (requestedRole === 'SUPER_ADMIN' && !s.isSuperAdmin) {
-        logSecurityEvent('role_escalation_blocked', { uidPrefix: s.uid.slice(0, 8) });
+        logStructured('warn', 'role_escalation_blocked', { uidPrefix: s.uid.slice(0, 8) });
         res.status(403).json({
           error: 'Only authorized platform administrators may hold the SUPER_ADMIN role.',
         });
         return;
       }
       res.json({
-        approvedRole: s.isBootstrapAdmin && requestedRole === 'SUPER_ADMIN' ? 'SUPER_ADMIN' : requestedRole,
+        approvedRole:
+          s.isSuperAdmin && requestedRole === 'SUPER_ADMIN' ? 'SUPER_ADMIN' : requestedRole,
         isSuperAdmin: s.isSuperAdmin,
       });
     }
@@ -220,11 +336,21 @@ export function createSonicPushApp(deps: SonicPushAppDeps = {}): Express {
       }
 
       try {
-        const targetDoc = await getDoc('users', targetUid, session.idToken);
+        let targetDoc: Record<string, unknown> | null = null;
+        try {
+          targetDoc = await adminDb.getDoc('users', targetUid);
+        } catch {
+          targetDoc = null;
+        }
+        if (!targetDoc) {
+          targetDoc = await getDoc('users', targetUid, session.idToken);
+        }
+
         if (!targetDoc) {
           res.status(404).json({ error: 'Target user record not found.' });
           return;
         }
+
         const targetEmail = typeof targetDoc.email === 'string' ? targetDoc.email.toLowerCase() : '';
         if (targetEmail === 'emma432cent@gmail.com' && nextRole !== 'SUPER_ADMIN') {
           res.status(403).json({
@@ -239,18 +365,65 @@ export function createSonicPushApp(deps: SonicPushAppDeps = {}): Express {
           return;
         }
 
-        await patchDoc(
-          'users',
-          targetUid,
-          { role: nextRole, updatedAt: new Date().toISOString() },
-          session.idToken
-        );
-        logSecurityEvent('admin_role_updated', {
+        const previousRole = typeof targetDoc.role === 'string' ? targetDoc.role : 'unknown';
+
+        // Persist role update in Firestore (Admin SDK primary, REST fallback if injected or starter tier)
+        let persisted = false;
+        try {
+          await adminDb.updateDoc('users', targetUid, {
+            role: nextRole,
+            updatedAt: SERVER_TIMESTAMP_SENTINEL,
+          });
+          persisted = true;
+        } catch (err) {
+          if (!isPermissionOrCredentialError(err) && !deps.patchDoc) {
+            throw err;
+          }
+        }
+
+        if (deps.patchDoc || !persisted) {
+          await patchDoc(
+            'users',
+            targetUid,
+            { role: nextRole, updatedAt: new Date().toISOString() },
+            session.idToken
+          );
+        }
+
+        // Sync Firebase Auth custom claims so Firestore & Storage `allow list` / admin rules match immediately upon token refresh
+        const claimSync = await syncRoleCustomClaims(targetUid, nextRole, adminAuth);
+
+        // Server-side immutable admin audit log
+        const auditId = `audit_srv_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
+        await adminDb
+          .setDoc('admin_audit_logs', auditId, {
+            id: auditId,
+            organizationId: session.organizationId || 'platform',
+            ownerId: session.uid,
+            assignedUserIds: [session.uid],
+            action: 'user_role_updated',
+            targetUid,
+            detail: `Role changed ${previousRole} -> ${nextRole} (claimsSynced=${claimSync.synced})`,
+            createdAt: SERVER_TIMESTAMP_SENTINEL,
+            updatedAt: SERVER_TIMESTAMP_SENTINEL,
+          })
+          .catch(() => null);
+
+        logStructured('info', 'admin_role_updated', {
           actorPrefix: session.uid.slice(0, 8),
           targetPrefix: targetUid.slice(0, 8),
+          previousRole,
           nextRole,
+          claimsSynced: claimSync.synced,
         });
-        res.json({ ok: true, targetUid, role: nextRole });
+
+        res.json({
+          ok: true,
+          targetUid,
+          role: nextRole,
+          claimsSynced: claimSync.synced,
+          claimsNote: claimSync.reason,
+        });
       } catch (err) {
         const msg = err instanceof Error ? err.message : 'Unable to update user role.';
         res.status(msg.includes('PERMISSION_DENIED') ? 403 : 500).json({
@@ -261,12 +434,113 @@ export function createSonicPushApp(deps: SonicPushAppDeps = {}): Express {
   );
 
   // ---------------------------------------------------------------------------
-  // 1. Song Intelligence Engine (Auth + Quota + Binary Signature + AI)
+  // Admin Diagnostics & Operations Console Endpoints
+  // ---------------------------------------------------------------------------
+  app.get(
+    '/api/admin/diagnostics',
+    verifyFirebaseAuth,
+    requireRole(['SUPER_ADMIN']),
+    async (_req: AuthenticatedRequest, res: Response) => {
+      try {
+        const [firebaseAdmin, recentWebhooks, recentCleanupLogs, aiUsageMetrics, failedCleanupSongs] =
+          await Promise.all([
+            getAdminDiag(),
+            paymentRepo.listAdminDiagnosticsWebhooks(40).catch(() => []),
+            audioRetention.listRecentCleanupLogs(25),
+            rateLimiter.getAdminUsageMetrics().catch(() => null),
+            adminDb
+              .queryDocs(
+                'songs',
+                [{ field: 'audioStorageCleanupStatus', op: '==', value: 'cleanup_failed' }],
+                { limit: 50 }
+              )
+              .catch(() => []),
+          ]);
+
+        const pendingRetryCount = recentWebhooks.filter(
+          (w) => w.reconciliationStatus === 'pending_retry'
+        ).length;
+        const quarantinedCount = recentWebhooks.filter(
+          (w) => w.reconciliationStatus === 'quarantined'
+        ).length;
+
+        res.json({
+          timestamp: new Date().toISOString(),
+          service: 'SONICPUSH AI',
+          providers: {
+            geminiConfigured: Boolean(process.env.GEMINI_API_KEY),
+            paystackConfigured: Boolean(process.env.PAYSTACK_SECRET_KEY),
+            flutterwaveConfigured: Boolean(process.env.FLUTTERWAVE_SECRET_KEY),
+            flutterwaveWebhookConfigured: Boolean(process.env.FLUTTERWAVE_SECRET_HASH),
+            stripeConfigured: Boolean(process.env.STRIPE_SECRET_KEY),
+            stripeWebhookConfigured: Boolean(process.env.STRIPE_WEBHOOK_SECRET),
+          },
+          firebaseAdmin,
+          webhookSummary: {
+            totalRecent: recentWebhooks.length,
+            pendingRetryCount,
+            quarantinedCount,
+            recentEvents: recentWebhooks.slice(0, 20),
+          },
+          audioCleanup: {
+            failedSongsCount: failedCleanupSongs.length,
+            recentLogs: recentCleanupLogs,
+          },
+          aiQuota: {
+            ...rateLimiter.getDiagnostics(),
+            usageMetrics: aiUsageMetrics,
+          },
+        });
+      } catch (err) {
+        logStructured('error', 'admin_diagnostics_error', {
+          error: sanitizeErrorMessage(err),
+        });
+        res.status(500).json({ error: 'Unable to retrieve platform diagnostics.' });
+      }
+    }
+  );
+
+  // Audio retention cleanup trigger (Super Admin OR Cloud Scheduler cron secret)
+  app.post('/api/admin/audio/cleanup', async (req: AuthenticatedRequest, res: Response) => {
+    const cronSecret = process.env.AUDIO_CLEANUP_CRON_SECRET;
+    const providedCronSecret = sanitizeTextField(req.headers['x-cron-secret'], 256);
+
+    const authorizedByCron =
+      Boolean(cronSecret) && Boolean(providedCronSecret) && timingSafeEqualStr(providedCronSecret, cronSecret!);
+
+    if (!authorizedByCron) {
+      // Fall back to standard Firebase Auth + SUPER_ADMIN role gate
+      await new Promise<void>((resolve) => {
+        verifyFirebaseAuth(req, res, () => resolve());
+      });
+      if (res.headersSent) return;
+      if (!req.authSession?.isSuperAdmin) {
+        res.status(403).json({
+          error: 'Access denied. Only SUPER_ADMIN or scheduled cleanup secret may trigger audio cleanup.',
+        });
+        return;
+      }
+    }
+
+    try {
+      const limit = Number(req.body?.limit) || 50;
+      const summary = await audioRetention.cleanupExpiredAudio({ limit });
+      res.json(summary);
+    } catch (err) {
+      logStructured('error', 'audio_cleanup_endpoint_failed', {
+        error: sanitizeErrorMessage(err),
+      });
+      res.status(500).json({ error: 'Audio retention cleanup execution failed.' });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // 1. Song Intelligence + Private Firebase Storage Audio Upload / Download / Delete
   // ---------------------------------------------------------------------------
   app.post(
     '/api/ai/song-intelligence',
     verifyFirebaseAuth,
-    aiQuotaMiddleware,
+    aiQuotaMiddleware('song_intelligence'),
     handleAudioUploadMiddleware,
     async (req: AuthenticatedRequest, res: Response) => {
       const started = Date.now();
@@ -285,10 +559,12 @@ export function createSonicPushApp(deps: SonicPushAppDeps = {}): Express {
         const requestedOrgId = sanitizeTextField(body.organizationId, 128);
 
         if (!title) {
+          if (req.file?.buffer) req.file.buffer.fill(0);
           res.status(400).json({ error: 'Song title is required.' });
           return;
         }
         if (requestedOrgId && !session.isSuperAdmin && requestedOrgId !== session.organizationId) {
+          if (req.file?.buffer) req.file.buffer.fill(0);
           res.status(403).json({ error: 'Cross-organization upload rejected.' });
           return;
         }
@@ -296,6 +572,8 @@ export function createSonicPushApp(deps: SonicPushAppDeps = {}): Express {
         const effectiveOrgId = requestedOrgId || session.organizationId || session.uid;
         const file = req.file;
         let audioProcessed = false;
+        let audioUploaded = false;
+        let audioUploadedAt = '';
         let audioDescriptor: {
           storageObjectPath: string;
           safeFilename: string;
@@ -309,19 +587,50 @@ export function createSonicPushApp(deps: SonicPushAppDeps = {}): Express {
 
         if (file) {
           const sigCheck = validateAudioUpload(file.buffer, file.mimetype, file.originalname);
-          if (!sigCheck.valid || !sigCheck.detectedFormat || !sigCheck.canonicalMimeType || !sigCheck.extension) {
-            // Release buffer immediately
+          if (
+            !sigCheck.valid ||
+            !sigCheck.detectedFormat ||
+            !sigCheck.canonicalMimeType ||
+            !sigCheck.extension
+          ) {
             file.buffer.fill(0);
             res.status(400).json({ error: sigCheck.error || 'Invalid audio file signature.' });
             return;
           }
 
           const storageMeta = generateSafeAudioStorageDescriptor(effectiveOrgId, sigCheck.extension);
+          audioUploadedAt = new Date().toISOString();
           audioDescriptor = {
             ...storageMeta,
             detectedFormat: sigCheck.detectedFormat,
             canonicalMimeType: sigCheck.canonicalMimeType,
           };
+
+          // Authoritative private server-side Firebase Storage upload (fail closed if storage fails)
+          try {
+            await audioStorage.uploadPrivateAudio({
+              storageObjectPath: storageMeta.storageObjectPath,
+              buffer: file.buffer,
+              contentType: sigCheck.canonicalMimeType,
+              ownerId: session.uid,
+              organizationId: effectiveOrgId,
+              retentionExpiresAt: storageMeta.retentionExpiresAt,
+              uploadedAt: audioUploadedAt,
+            });
+            audioUploaded = true;
+          } catch (storageErr) {
+            file.buffer.fill(0);
+            logStructured('error', 'audio_private_storage_upload_failed', {
+              uidPrefix: session.uid.slice(0, 8),
+              orgId: effectiveOrgId,
+              error: sanitizeErrorMessage(storageErr),
+            });
+            res.status(502).json({
+              error:
+                'Private audio storage upload failed. Verify Firebase Storage configuration and IAM permissions before retrying.',
+            });
+            return;
+          }
 
           parts.push({
             inlineData: {
@@ -330,7 +639,6 @@ export function createSonicPushApp(deps: SonicPushAppDeps = {}): Express {
             },
           });
           audioProcessed = true;
-          // Clear buffer from memory once base64 encoded
           file.buffer.fill(0);
         }
 
@@ -408,18 +716,33 @@ CRITICAL HONESTY & GROUNDING RULES:
 
         const parsed = JSON.parse((response.text ?? '{}').trim());
         const latencyMs = Date.now() - started;
-        logSecurityEvent('ai_song_intelligence', {
-          uidPrefix: session.uid.slice(0, 8),
-          audioProcessed,
+
+        void rateLimiter.recordUsageLog({
+          uid: session.uid,
+          organizationId: effectiveOrgId,
+          feature: 'song_intelligence',
+          model: 'gemini-4-hydrogen',
+          status: 'success',
           latencyMs,
         });
+
+        logStructured('info', 'ai_song_intelligence', {
+          uidPrefix: session.uid.slice(0, 8),
+          audioProcessed,
+          audioUploaded,
+          latencyMs,
+        });
+
         res.json({
           audioProcessed,
+          audioUploaded,
           audioFileName: audioDescriptor?.safeFilename || '',
           audioStoragePath: audioDescriptor?.storageObjectPath || '',
           audioMimeType: audioDescriptor?.canonicalMimeType || '',
           audioSignatureFormat: audioDescriptor?.detectedFormat || '',
+          audioUploadedAt: audioUploadedAt || '',
           audioRetentionExpiresAt: audioDescriptor?.retentionExpiresAt || '',
+          audioStorageCleanupStatus: audioUploaded ? 'active' : 'none',
           verifiedObservations: parsed.verifiedObservations || [],
           aiHypotheses: parsed.aiHypotheses,
           latencyMs,
@@ -430,12 +753,188 @@ CRITICAL HONESTY & GROUNDING RULES:
           req.file.buffer.fill(0);
         }
         const safeErr = formatSafeGeminiError(err, 'Failed to analyze song release.');
-        logSecurityEvent('ai_song_intelligence_error', {
+        void rateLimiter.recordUsageLog({
+          uid: session.uid,
+          organizationId: session.organizationId || session.uid,
+          feature: 'song_intelligence',
+          model: 'gemini-4-hydrogen',
+          status: 'error',
+          latencyMs: Date.now() - started,
+        });
+        logStructured('error', 'ai_song_intelligence_error', {
           uidPrefix: session.uid.slice(0, 8),
           status: safeErr.status,
           latencyMs: Date.now() - started,
         });
         res.status(safeErr.status).json({ error: safeErr.message, latencyMs: Date.now() - started });
+      }
+    }
+  );
+
+  // Authorized private audio URL / download stream (strict organization & assignment verification)
+  app.get(
+    '/api/songs/:songId/audio-url',
+    verifyFirebaseAuth,
+    async (req: AuthenticatedRequest, res: Response) => {
+      const session = req.authSession!;
+      const songId = sanitizeTextField(req.params.songId, 128);
+      if (!songId || !/^[a-zA-Z0-9_-]+$/.test(songId)) {
+        res.status(400).json({ error: 'Invalid song identifier.' });
+        return;
+      }
+
+      try {
+        let song = await adminDb.getDoc('songs', songId).catch(() => null);
+        if (!song) {
+          song = await getDoc('songs', songId, session.idToken).catch(() => null);
+        }
+        if (!song) {
+          res.status(404).json({ error: 'Song not found.' });
+          return;
+        }
+
+        const songOrg = typeof song.organizationId === 'string' ? song.organizationId : '';
+        const assignedUsers = Array.isArray(song.assignedUserIds)
+          ? (song.assignedUserIds as string[])
+          : [];
+        const authorized =
+          session.isSuperAdmin ||
+          song.ownerId === session.uid ||
+          assignedUsers.includes(session.uid) ||
+          (Boolean(session.organizationId) && session.organizationId === songOrg);
+
+        if (!authorized) {
+          res.status(403).json({ error: 'Cross-organization audio access denied.' });
+          return;
+        }
+
+        const storagePath = typeof song.audioStoragePath === 'string' ? song.audioStoragePath : '';
+        if (!storagePath || song.audioStorageCleanupStatus === 'deleted') {
+          res.status(404).json({ error: 'No active private audio file exists for this song.' });
+          return;
+        }
+
+        if (audioStorage.getSignedReadUrl) {
+          try {
+            const url = await audioStorage.getSignedReadUrl(storagePath, 900);
+            res.json({
+              mode: 'signed_url',
+              url,
+              expiresInSeconds: 900,
+              storageObjectPath: storagePath,
+            });
+            return;
+          } catch {
+            // Fall through to authorized server proxy stream when IAM signBlob is unavailable (e.g. emulator)
+          }
+        }
+
+        res.json({
+          mode: 'proxy_stream',
+          url: `/api/songs/${encodeURIComponent(songId)}/audio-stream`,
+          storageObjectPath: storagePath,
+        });
+      } catch (err) {
+        res.status(500).json({ error: sanitizeErrorMessage(err, 'Failed to authorize audio download.') });
+      }
+    }
+  );
+
+  app.get(
+    '/api/songs/:songId/audio-stream',
+    verifyFirebaseAuth,
+    async (req: AuthenticatedRequest, res: Response) => {
+      const session = req.authSession!;
+      const songId = sanitizeTextField(req.params.songId, 128);
+      if (!songId || !/^[a-zA-Z0-9_-]+$/.test(songId)) {
+        res.status(400).json({ error: 'Invalid song identifier.' });
+        return;
+      }
+
+      try {
+        let song = await adminDb.getDoc('songs', songId).catch(() => null);
+        if (!song) {
+          song = await getDoc('songs', songId, session.idToken).catch(() => null);
+        }
+        if (!song) {
+          res.status(404).json({ error: 'Song not found.' });
+          return;
+        }
+
+        const songOrg = typeof song.organizationId === 'string' ? song.organizationId : '';
+        const assignedUsers = Array.isArray(song.assignedUserIds)
+          ? (song.assignedUserIds as string[])
+          : [];
+        const authorized =
+          session.isSuperAdmin ||
+          song.ownerId === session.uid ||
+          assignedUsers.includes(session.uid) ||
+          (Boolean(session.organizationId) && session.organizationId === songOrg);
+
+        if (!authorized) {
+          res.status(403).json({ error: 'Cross-organization audio stream access denied.' });
+          return;
+        }
+
+        const storagePath = typeof song.audioStoragePath === 'string' ? song.audioStoragePath : '';
+        if (!storagePath || song.audioStorageCleanupStatus === 'deleted') {
+          res.status(404).json({ error: 'Audio object is unavailable or has expired.' });
+          return;
+        }
+
+        if (!audioStorage.readAudioStream) {
+          res.status(501).json({ error: 'Server audio streaming is not supported.' });
+          return;
+        }
+
+        const streamed = await audioStorage.readAudioStream(storagePath);
+        res.setHeader(
+          'Content-Type',
+          streamed.contentType ||
+            (typeof song.audioMimeType === 'string' ? song.audioMimeType : 'application/octet-stream')
+        );
+        res.setHeader('Cache-Control', 'private, no-store');
+        res.send(streamed.buffer);
+      } catch {
+        res.status(404).json({ error: 'Audio file could not be retrieved from storage.' });
+      }
+    }
+  );
+
+  app.delete(
+    '/api/songs/:songId',
+    verifyFirebaseAuth,
+    async (req: AuthenticatedRequest, res: Response) => {
+      const session = req.authSession!;
+      const songId = sanitizeTextField(req.params.songId, 128);
+      if (!songId || !/^[a-zA-Z0-9_-]+$/.test(songId)) {
+        res.status(400).json({ error: 'Invalid song identifier.' });
+        return;
+      }
+
+      try {
+        let song = await adminDb.getDoc('songs', songId).catch(() => null);
+        if (!song) {
+          song = await getDoc('songs', songId, session.idToken).catch(() => null);
+        }
+        if (!song) {
+          res.status(404).json({ error: 'Song not found.' });
+          return;
+        }
+
+        if (!session.isSuperAdmin && song.ownerId !== session.uid) {
+          res.status(403).json({ error: 'Only the song owner or SUPER_ADMIN may delete this release.' });
+          return;
+        }
+
+        const storagePath = typeof song.audioStoragePath === 'string' ? song.audioStoragePath : '';
+        if (storagePath && song.audioStorageCleanupStatus !== 'deleted') {
+          await audioStorage.deleteAudioObject(storagePath).catch(() => null);
+        }
+        await adminDb.deleteDoc('songs', songId);
+        res.json({ ok: true, songId });
+      } catch (err) {
+        res.status(500).json({ error: sanitizeErrorMessage(err, 'Failed to delete song.') });
       }
     }
   );
@@ -446,7 +945,7 @@ CRITICAL HONESTY & GROUNDING RULES:
   app.post(
     '/api/ai/campaign-generate',
     verifyFirebaseAuth,
-    aiQuotaMiddleware,
+    aiQuotaMiddleware('campaign_generate'),
     async (req: AuthenticatedRequest, res: Response) => {
       const started = Date.now();
       const session = req.authSession!;
@@ -460,7 +959,10 @@ CRITICAL HONESTY & GROUNDING RULES:
         const campaignType = sanitizeTextField(body.campaignType, 100);
         const targetMarkets = sanitizeTextField(body.targetMarkets, 300);
         const currency = sanitizeTextField(body.currency, 8) || 'NGN';
-        const durationDays = Math.min(365, Math.max(1, Math.round(Number(body.durationDays) || 30)));
+        const durationDays = Math.min(
+          365,
+          Math.max(1, Math.round(Number(body.durationDays) || 30))
+        );
         const budget = Math.max(0, Number(body.budget) || 0);
 
         if (!artistName || !campaignType) {
@@ -538,10 +1040,29 @@ STRICT INTEGRITY RULES:
 
         const strategySections = JSON.parse((response.text ?? '{}').trim());
         const latencyMs = Date.now() - started;
-        logSecurityEvent('ai_campaign_generate', { uidPrefix: session.uid.slice(0, 8), latencyMs });
+        void rateLimiter.recordUsageLog({
+          uid: session.uid,
+          organizationId: session.organizationId || session.uid,
+          feature: 'campaign_generate',
+          model: 'gemini-4-hydrogen',
+          status: 'success',
+          latencyMs,
+        });
+        logStructured('info', 'ai_campaign_generate', {
+          uidPrefix: session.uid.slice(0, 8),
+          latencyMs,
+        });
         res.json({ strategySections, latencyMs, model: 'gemini-4-hydrogen' });
       } catch (err) {
         const safeErr = formatSafeGeminiError(err, 'Failed to generate campaign strategy.');
+        void rateLimiter.recordUsageLog({
+          uid: session.uid,
+          organizationId: session.organizationId || session.uid,
+          feature: 'campaign_generate',
+          model: 'gemini-4-hydrogen',
+          status: 'error',
+          latencyMs: Date.now() - started,
+        });
         res.status(safeErr.status).json({ error: safeErr.message, latencyMs: Date.now() - started });
       }
     }
@@ -553,7 +1074,7 @@ STRICT INTEGRITY RULES:
   app.post(
     '/api/ai/content-studio',
     verifyFirebaseAuth,
-    aiQuotaMiddleware,
+    aiQuotaMiddleware('content_studio'),
     async (req: AuthenticatedRequest, res: Response) => {
       const started = Date.now();
       const session = req.authSession!;
@@ -622,10 +1143,29 @@ CRITICAL RULE: Do NOT describe any concept or audio format as "currently trendin
 
         const ideas = JSON.parse((response.text ?? '[]').trim());
         const latencyMs = Date.now() - started;
-        logSecurityEvent('ai_content_studio', { uidPrefix: session.uid.slice(0, 8), latencyMs });
+        void rateLimiter.recordUsageLog({
+          uid: session.uid,
+          organizationId: session.organizationId || session.uid,
+          feature: 'content_studio',
+          model: 'gemini-4-hydrogen',
+          status: 'success',
+          latencyMs,
+        });
+        logStructured('info', 'ai_content_studio', {
+          uidPrefix: session.uid.slice(0, 8),
+          latencyMs,
+        });
         res.json({ ideas, latencyMs, model: 'gemini-4-hydrogen' });
       } catch (err) {
         const safeErr = formatSafeGeminiError(err, 'Failed to generate content concepts.');
+        void rateLimiter.recordUsageLog({
+          uid: session.uid,
+          organizationId: session.organizationId || session.uid,
+          feature: 'content_studio',
+          model: 'gemini-4-hydrogen',
+          status: 'error',
+          latencyMs: Date.now() - started,
+        });
         res.status(safeErr.status).json({ error: safeErr.message, latencyMs: Date.now() - started });
       }
     }
@@ -637,7 +1177,7 @@ CRITICAL RULE: Do NOT describe any concept or audio format as "currently trendin
   app.post(
     '/api/ai/trends',
     verifyFirebaseAuth,
-    aiQuotaMiddleware,
+    aiQuotaMiddleware('trends'),
     async (req: AuthenticatedRequest, res: Response) => {
       const started = Date.now();
       const session = req.authSession!;
@@ -691,7 +1231,15 @@ Format the response strictly as a JSON array inside \`\`\`json ... \`\`\` where 
         }
 
         const latencyMs = Date.now() - started;
-        logSecurityEvent('ai_trends', { uidPrefix: session.uid.slice(0, 8), latencyMs });
+        void rateLimiter.recordUsageLog({
+          uid: session.uid,
+          organizationId: session.organizationId || session.uid,
+          feature: 'trends',
+          model: 'gemini-4-hydrogen',
+          status: 'success',
+          latencyMs,
+        });
+        logStructured('info', 'ai_trends', { uidPrefix: session.uid.slice(0, 8), latencyMs });
         res.json({
           trends: parsedTrends,
           summaryMarkdown: parsedTrends.length === 0 ? rawText : '',
@@ -701,6 +1249,14 @@ Format the response strictly as a JSON array inside \`\`\`json ... \`\`\` where 
         });
       } catch (err) {
         const safeErr = formatSafeGeminiError(err, 'Failed to research live trends.');
+        void rateLimiter.recordUsageLog({
+          uid: session.uid,
+          organizationId: session.organizationId || session.uid,
+          feature: 'trends',
+          model: 'gemini-4-hydrogen',
+          status: 'error',
+          latencyMs: Date.now() - started,
+        });
         res.status(safeErr.status).json({ error: safeErr.message, latencyMs: Date.now() - started });
       }
     }
@@ -712,7 +1268,7 @@ Format the response strictly as a JSON array inside \`\`\`json ... \`\`\` where 
   app.post(
     '/api/ai/outreach-draft',
     verifyFirebaseAuth,
-    aiQuotaMiddleware,
+    aiQuotaMiddleware('outreach_draft'),
     async (req: AuthenticatedRequest, res: Response) => {
       const started = Date.now();
       const session = req.authSession!;
@@ -766,7 +1322,18 @@ STRICT RULE: Never promise guaranteed airplay, coverage, or playlist placement. 
 
         const draft = JSON.parse((response.text ?? '{}').trim());
         const latencyMs = Date.now() - started;
-        logSecurityEvent('ai_outreach_draft', { uidPrefix: session.uid.slice(0, 8), latencyMs });
+        void rateLimiter.recordUsageLog({
+          uid: session.uid,
+          organizationId: session.organizationId || session.uid,
+          feature: 'outreach_draft',
+          model: 'gemini-4-hydrogen',
+          status: 'success',
+          latencyMs,
+        });
+        logStructured('info', 'ai_outreach_draft', {
+          uidPrefix: session.uid.slice(0, 8),
+          latencyMs,
+        });
         res.json({
           subject: draft.subject || '',
           messageBody: draft.messageBody || '',
@@ -775,6 +1342,14 @@ STRICT RULE: Never promise guaranteed airplay, coverage, or playlist placement. 
         });
       } catch (err) {
         const safeErr = formatSafeGeminiError(err, 'Failed to draft outreach message.');
+        void rateLimiter.recordUsageLog({
+          uid: session.uid,
+          organizationId: session.organizationId || session.uid,
+          feature: 'outreach_draft',
+          model: 'gemini-4-hydrogen',
+          status: 'error',
+          latencyMs: Date.now() - started,
+        });
         res.status(safeErr.status).json({ error: safeErr.message, latencyMs: Date.now() - started });
       }
     }
@@ -786,7 +1361,7 @@ STRICT RULE: Never promise guaranteed airplay, coverage, or playlist placement. 
   app.post(
     '/api/ai/assistant',
     verifyFirebaseAuth,
-    aiQuotaMiddleware,
+    aiQuotaMiddleware('assistant'),
     async (req: AuthenticatedRequest, res: Response) => {
       const started = Date.now();
       const session = req.authSession!;
@@ -799,7 +1374,7 @@ STRICT RULE: Never promise guaranteed airplay, coverage, or playlist placement. 
 
         const requestedOrgId = sanitizeTextField(req.body?.organizationId, 128);
         if (requestedOrgId && !session.isSuperAdmin && requestedOrgId !== session.organizationId) {
-          logSecurityEvent('cross_org_ai_query_blocked', {
+          logStructured('warn', 'cross_org_ai_query_blocked', {
             uidPrefix: session.uid.slice(0, 8),
           });
           res.status(403).json({
@@ -809,7 +1384,6 @@ STRICT RULE: Never promise guaranteed airplay, coverage, or playlist placement. 
         }
 
         const effectiveOrgId = requestedOrgId || session.organizationId;
-        // NEVER trust browser-submitted workspaceContext; retrieve verified records server-side
         const serverWorkspaceSnapshot = await fetchContext({
           idToken: session.idToken,
           uid: session.uid,
@@ -848,7 +1422,15 @@ STRICT INTEGRITY RULES:
         });
 
         const latencyMs = Date.now() - started;
-        logSecurityEvent('ai_assistant', { uidPrefix: session.uid.slice(0, 8), latencyMs });
+        void rateLimiter.recordUsageLog({
+          uid: session.uid,
+          organizationId: effectiveOrgId || session.uid,
+          feature: 'assistant',
+          model: 'gemini-4-hydrogen',
+          status: 'success',
+          latencyMs,
+        });
+        logStructured('info', 'ai_assistant', { uidPrefix: session.uid.slice(0, 8), latencyMs });
         res.json({
           reply: response.text || 'I could not generate a response for that request.',
           contextRecordCounts: {
@@ -861,15 +1443,23 @@ STRICT INTEGRITY RULES:
         });
       } catch (err) {
         const safeErr = formatSafeGeminiError(err, 'Failed to query SONICPUSH AI Assistant.');
+        void rateLimiter.recordUsageLog({
+          uid: session.uid,
+          organizationId: session.organizationId || session.uid,
+          feature: 'assistant',
+          model: 'gemini-4-hydrogen',
+          status: 'error',
+          latencyMs: Date.now() - started,
+        });
         res.status(safeErr.status).json({ error: safeErr.message, latencyMs: Date.now() - started });
       }
     }
   );
 
   // ---------------------------------------------------------------------------
-  // 7. Payment Verification, Ledger & Raw-Body Webhooks
+  // 7. Payment Verification, Firestore Ledger, Retries & Raw-Body Webhooks
   // ---------------------------------------------------------------------------
-  app.get('/api/payments/ledger', verifyFirebaseAuth, (req: AuthenticatedRequest, res: Response) => {
+  app.get('/api/payments/ledger', verifyFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
     const session = req.authSession!;
     const requestedOrgId = sanitizeTextField(req.query.organizationId, 128);
     if (requestedOrgId && !session.isSuperAdmin && requestedOrgId !== session.organizationId) {
@@ -881,7 +1471,22 @@ STRICT INTEGRITY RULES:
       res.json({ bindings: [], webhooks: [] });
       return;
     }
-    res.json(ledger.listOrganizationRecords(targetOrg));
+
+    try {
+      const records = await paymentRepo.listOrganizationRecords(targetOrg);
+      res.json(records);
+    } catch (err) {
+      if (isPermissionOrCredentialError(err)) {
+        res.json({
+          bindings: [],
+          webhooks: [],
+          diagnosticNote:
+            'Shared Firestore payment ledger requires Firebase Admin IAM permissions (unavailable on un-upgraded Starter Tier).',
+        });
+        return;
+      }
+      res.status(500).json({ error: 'Unable to retrieve payment ledger from Firestore.' });
+    }
   });
 
   app.post(
@@ -914,8 +1519,11 @@ STRICT INTEGRITY RULES:
           return;
         }
 
-        // Retrieve authoritative invoice directly from Firestore via caller's ID token
-        const invoice = await getDoc('invoices', invoiceId, session.idToken);
+        // Retrieve authoritative invoice directly from Firestore
+        let invoice = await adminDb.getDoc('invoices', invoiceId).catch(() => null);
+        if (!invoice) {
+          invoice = await getDoc('invoices', invoiceId, session.idToken);
+        }
         if (!invoice) {
           res.status(404).json({ error: 'Invoice not found or access denied.' });
           return;
@@ -944,133 +1552,27 @@ STRICT INTEGRITY RULES:
           return;
         }
 
-        const conflict = ledger.checkReferenceConflict(provider, reference, invoiceId, invoiceOrgId);
-        if (conflict) {
-          res.status(409).json({ error: conflict });
-          return;
-        }
-
-        // Also check Firestore payments collection for cross-invoice / cross-org reference reuse
-        const existingFirestorePayments = await runQuery(
-          'payments',
-          session.idToken,
-          [{ field: 'reference', op: 'EQUAL', value: reference }],
-          5
-        ).catch(() => []);
-
-        for (const p of existingFirestorePayments) {
-          if (p.provider === provider && (p.invoiceId !== invoiceId || p.organizationId !== invoiceOrgId)) {
-            res.status(409).json({
-              error: 'Payment reference already exists on another invoice or organization.',
-            });
-            return;
-          }
-        }
-
-        const invoiceCurrency = (typeof invoice.currency === 'string' ? invoice.currency : 'NGN') as CurrencyCode;
+        const invoiceCurrency = (
+          typeof invoice.currency === 'string' ? invoice.currency : 'NGN'
+        ) as CurrencyCode;
         const invoiceAmount = Number(invoice.amount);
-        const expectedMinor = toMinorUnits(invoiceAmount, invoiceCurrency);
-        if (expectedMinor <= 0) {
-          res.status(400).json({ error: 'Invoice amount must be greater than zero to verify payment.' });
-          return;
-        }
 
-        let result: {
-          verified: boolean;
-          verificationStatus:
-            | 'pending'
-            | 'awaiting_provider_integration'
-            | 'verified'
-            | 'failed'
-            | 'refunded'
-            | 'disputed';
-          providerTransactionId?: string;
-          message: string;
-        };
-
-        if (provider === 'paystack') {
-          result = await verifyPaystackWithProvider({
-            reference,
-            expectedAmountMinor: expectedMinor,
-            expectedCurrency: invoiceCurrency,
-            invoiceId,
-            fetchImpl: deps.fetchImpl,
-          });
-        } else if (provider === 'flutterwave') {
-          result = await verifyFlutterwaveWithProvider({
-            reference,
-            transactionId: transactionId || undefined,
-            expectedAmountMinor: expectedMinor,
-            expectedCurrency: invoiceCurrency,
-            invoiceId,
-            fetchImpl: deps.fetchImpl,
-          });
-        } else if (provider === 'stripe') {
-          result = await verifyStripeWithProvider({
-            reference,
-            expectedAmountMinor: expectedMinor,
-            expectedCurrency: invoiceCurrency,
-            invoiceId,
-          });
-        } else {
-          result = {
-            verified: false,
-            verificationStatus: 'pending',
-            message:
-              'Manual bank transfer logged as pending. Only an authorized administrator can reconcile manual transfers.',
-          };
-        }
-
-        const nowIso = new Date().toISOString();
-        ledger.upsertReferenceBinding({
-          bindingKey: `${provider}:${reference}`,
+        const result = await paymentRepo.verifyAndBindReference({
           provider,
           reference,
+          transactionId: transactionId || undefined,
           invoiceId,
-          organizationId: invoiceOrgId,
-          currency: invoiceCurrency,
-          expectedMinor,
-          verificationStatus: result.verificationStatus,
-          providerTransactionId: result.providerTransactionId,
-          updatedAt: nowIso,
+          invoiceOrganizationId: invoiceOrgId,
+          invoiceCurrency,
+          invoiceAmount,
+          isSuperAdmin: session.isSuperAdmin,
         });
 
-        const serverAttestation = signPaymentAttestation({
-          invoiceId,
-          organizationId: invoiceOrgId,
-          provider,
-          reference,
-          amountMinor: expectedMinor,
-          currency: invoiceCurrency,
-          verificationStatus: result.verificationStatus,
-        });
-
-        // If verified & caller is SUPER_ADMIN, synchronize authoritative invoice status server-side
-        let invoiceReconciled = false;
-        if (result.verified && session.isSuperAdmin) {
-          try {
-            await patchDoc(
-              'invoices',
-              invoiceId,
-              {
-                status: 'paid',
-                verifiedPaymentRef: reference,
-                paidAt: nowIso,
-                updatedAt: nowIso,
-              },
-              session.idToken
-            );
-            invoiceReconciled = true;
-          } catch {
-            invoiceReconciled = false;
-          }
-        }
-
-        logSecurityEvent('payment_verify_checked', {
+        logStructured('info', 'payment_verify_checked', {
           provider,
           verificationStatus: result.verificationStatus,
           verified: result.verified,
-          invoiceReconciled,
+          invoiceReconciled: result.invoiceReconciled,
         });
 
         res.json({
@@ -1081,11 +1583,24 @@ STRICT INTEGRITY RULES:
           currency: invoiceCurrency,
           amount: invoiceAmount,
           providerTransactionId: result.providerTransactionId || '',
-          serverAttestation,
-          invoiceReconciled,
+          serverAttestation: result.serverAttestation,
+          invoiceReconciled: result.invoiceReconciled,
           message: result.message,
         });
       } catch (err) {
+        if (err instanceof ReferenceConflictError) {
+          res.status(409).json({ error: err.message });
+          return;
+        }
+        if (isPermissionOrCredentialError(err)) {
+          res.status(503).json({
+            verified: false,
+            verificationStatus: 'failed',
+            error:
+              'Shared Firestore payment ledger requires Firebase Admin IAM permissions in this environment.',
+          });
+          return;
+        }
         const msg = err instanceof Error ? err.message : 'Payment verification failed.';
         res.status(msg.includes('PERMISSION_DENIED') ? 403 : 500).json({
           verified: false,
@@ -1103,7 +1618,6 @@ STRICT INTEGRITY RULES:
     verifyFirebaseAuth,
     requireRole(['SUPER_ADMIN']),
     async (req: AuthenticatedRequest, res: Response) => {
-      const session = req.authSession!;
       const invoiceId = sanitizeTextField(req.body?.invoiceId, 128);
       const paymentId = sanitizeTextField(req.body?.paymentId, 128);
       const provider = sanitizeTextField(req.body?.provider, 32) as PaymentProvider;
@@ -1114,81 +1628,81 @@ STRICT INTEGRITY RULES:
         return;
       }
 
-      const binding = ledger.getReferenceBinding(provider, reference);
-      if (!binding || binding.invoiceId !== invoiceId) {
-        res.status(404).json({ error: 'No matching server verification or webhook record found for this reference.' });
-        return;
-      }
-      if (
-        binding.verificationStatus !== 'verified' &&
-        binding.verificationStatus !== 'refunded' &&
-        binding.verificationStatus !== 'disputed'
-      ) {
-        res.status(409).json({
-          error: `Reference is in "${binding.verificationStatus}" state and cannot be reconciled as settled.`,
-        });
-        return;
-      }
-
-      const nowIso = new Date().toISOString();
-      const targetInvoiceStatus =
-        binding.verificationStatus === 'verified'
-          ? 'paid'
-          : binding.verificationStatus === 'refunded'
-          ? 'refunded'
-          : 'disputed';
-
       try {
-        await patchDoc(
-          'invoices',
+        const reconciled = await paymentRepo.reconcilePayment({
           invoiceId,
-          {
-            status: targetInvoiceStatus,
-            verifiedPaymentRef: reference,
-            ...(targetInvoiceStatus === 'paid' ? { paidAt: nowIso } : {}),
-            updatedAt: nowIso,
-          },
-          session.idToken
-        );
-
-        if (paymentId) {
-          await patchDoc(
-            'payments',
-            paymentId,
-            {
-              verificationStatus: binding.verificationStatus,
-              verificationSource: 'server_api',
-              verifiedAt: nowIso,
-              ...(binding.providerTransactionId
-                ? { providerTransactionId: binding.providerTransactionId }
-                : {}),
-              updatedAt: nowIso,
-            },
-            session.idToken
-          );
-        }
-
-        res.json({
-          ok: true,
-          invoiceId,
-          invoiceStatus: targetInvoiceStatus,
-          verificationStatus: binding.verificationStatus,
+          paymentId: paymentId || undefined,
+          provider,
+          reference,
         });
-      } catch {
+        res.json({ ok: true, ...reconciled });
+      } catch (err) {
+        if (err instanceof ReferenceConflictError) {
+          res.status(409).json({ error: err.message });
+          return;
+        }
+        const msg = err instanceof Error ? err.message : '';
+        if (msg === 'BINDING_NOT_FOUND' || msg === 'INVOICE_NOT_FOUND') {
+          res.status(404).json({
+            error: 'No matching server verification or webhook record found for this reference.',
+          });
+          return;
+        }
+        if (msg.startsWith('INVALID_STATE:')) {
+          const state = msg.split(':')[1] || 'pending';
+          res.status(409).json({
+            error: `Reference is in "${state}" state and cannot be reconciled as settled.`,
+          });
+          return;
+        }
         res.status(500).json({ error: 'Failed to reconcile payment state into Firestore.' });
       }
     }
   );
 
+  app.post(
+    '/api/payments/webhooks/:eventDocId/retry',
+    verifyFirebaseAuth,
+    requireRole(['SUPER_ADMIN']),
+    async (req: AuthenticatedRequest, res: Response) => {
+      const eventDocId = sanitizeTextField(req.params.eventDocId, 128);
+      if (!eventDocId || !/^[a-zA-Z0-9_-]+$/.test(eventDocId)) {
+        res.status(400).json({ error: 'Invalid webhook event identifier.' });
+        return;
+      }
+
+      try {
+        const result = await paymentRepo.retryPendingWebhook(eventDocId);
+        if (result.retryable) {
+          res.status(500).json({
+            ok: false,
+            ...result,
+            error: 'Reconciliation retry failed transiently.',
+          });
+          return;
+        }
+        res.json({ ok: true, ...result });
+      } catch (err) {
+        if (err instanceof Error && err.message === 'WEBHOOK_EVENT_NOT_FOUND') {
+          res.status(404).json({ error: 'Webhook event record not found.' });
+          return;
+        }
+        res.status(500).json({ error: 'Failed to retry webhook reconciliation.' });
+      }
+    }
+  );
+
   // ---------------------------------------------------------------------------
-  // Webhooks (Raw Body Preserved + Official Signature Verification + Idempotency)
+  // Webhooks (Raw Body + Official Signature + Authoritative API Verification + Firestore Atomic Tx)
   // ---------------------------------------------------------------------------
-  app.post('/api/payments/webhook/:provider', (req: AuthenticatedRequest, res: Response) => {
+  app.post('/api/payments/webhook/:provider', async (req: AuthenticatedRequest, res: Response) => {
     const providerParam = sanitizeTextField(req.params.provider, 32) as PaymentProvider;
     const rawBody = req.rawBody;
 
     if (!rawBody || rawBody.length === 0) {
-      res.status(400).json({ error: 'Raw request body is required for webhook signature verification.' });
+      res
+        .status(400)
+        .json({ error: 'Raw request body is required for webhook signature verification.' });
       return;
     }
 
@@ -1204,76 +1718,25 @@ STRICT INTEGRITY RULES:
       }
       const sig = req.headers['x-paystack-signature'] as string | undefined;
       if (!verifyPaystackWebhookSignature(rawBody, sig, secret)) {
-        logSecurityEvent('webhook_invalid_signature', { provider: 'paystack' });
+        logStructured('warn', 'webhook_invalid_signature', { provider: 'paystack' });
         res.status(401).json({ error: 'Invalid Paystack webhook signature.' });
         return;
       }
 
-      const normalized = normalizePaystackWebhookPayload((req.body || {}) as Record<string, unknown>);
+      const normalized = normalizePaystackWebhookPayload(
+        (req.body || {}) as Record<string, unknown>
+      );
       if (!normalized) {
         res.status(400).json({ error: 'Malformed Paystack webhook payload.' });
         return;
       }
 
-      const existingEvent = ledger.hasProcessedWebhook('paystack', normalized.eventId);
-      if (existingEvent) {
-        res.status(200).json({
-          received: true,
-          duplicate: true,
-          eventId: normalized.eventId,
-          outcome: existingEvent.outcome,
-        });
+      const result = await paymentRepo.processWebhook({ provider: 'paystack', normalized });
+      if (result.retryable) {
+        res.status(500).json(result);
         return;
       }
-
-      const existingBinding = ledger.getReferenceBinding('paystack', normalized.reference);
-      let finalOutcome = normalized.outcome;
-      let note = 'Processed verified Paystack webhook.';
-
-      if (existingBinding) {
-        if (
-          normalized.amountMinor !== undefined &&
-          normalized.amountMinor !== existingBinding.expectedMinor
-        ) {
-          finalOutcome = 'failed';
-          note = 'Webhook amount mismatch against bound invoice.';
-        } else if (
-          normalized.currency &&
-          normalized.currency !== existingBinding.currency.toUpperCase()
-        ) {
-          finalOutcome = 'failed';
-          note = 'Webhook currency mismatch against bound invoice.';
-        } else {
-          ledger.upsertReferenceBinding({
-            ...existingBinding,
-            verificationStatus: finalOutcome,
-            providerTransactionId:
-              normalized.providerTransactionId || existingBinding.providerTransactionId,
-            updatedAt: new Date().toISOString(),
-          });
-        }
-      }
-
-      ledger.recordWebhookEvent({
-        idempotencyKey: `paystack:${normalized.eventId}`,
-        provider: 'paystack',
-        eventId: normalized.eventId,
-        eventType: normalized.eventType,
-        reference: normalized.reference,
-        invoiceId: normalized.invoiceId || existingBinding?.invoiceId,
-        organizationId: normalized.organizationId || existingBinding?.organizationId,
-        outcome: finalOutcome,
-        processedAt: new Date().toISOString(),
-        note,
-      });
-
-      res.status(200).json({
-        received: true,
-        duplicate: false,
-        provider: 'paystack',
-        eventId: normalized.eventId,
-        outcome: finalOutcome,
-      });
+      res.status(200).json(result);
       return;
     }
 
@@ -1294,75 +1757,25 @@ STRICT INTEGRITY RULES:
         secretHash,
       });
       if (!valid) {
-        logSecurityEvent('webhook_invalid_signature', { provider: 'flutterwave' });
+        logStructured('warn', 'webhook_invalid_signature', { provider: 'flutterwave' });
         res.status(401).json({ error: 'Invalid Flutterwave webhook signature.' });
         return;
       }
 
-      const normalized = normalizeFlutterwaveWebhookPayload((req.body || {}) as Record<string, unknown>);
+      const normalized = normalizeFlutterwaveWebhookPayload(
+        (req.body || {}) as Record<string, unknown>
+      );
       if (!normalized) {
         res.status(400).json({ error: 'Malformed Flutterwave webhook payload.' });
         return;
       }
 
-      const existingEvent = ledger.hasProcessedWebhook('flutterwave', normalized.eventId);
-      if (existingEvent) {
-        res.status(200).json({
-          received: true,
-          duplicate: true,
-          eventId: normalized.eventId,
-          outcome: existingEvent.outcome,
-        });
+      const result = await paymentRepo.processWebhook({ provider: 'flutterwave', normalized });
+      if (result.retryable) {
+        res.status(500).json(result);
         return;
       }
-
-      const existingBinding = ledger.getReferenceBinding('flutterwave', normalized.reference);
-      let finalOutcome = normalized.outcome;
-      let note = 'Processed verified Flutterwave webhook.';
-      if (existingBinding) {
-        if (
-          normalized.amountMinor !== undefined &&
-          normalized.amountMinor !== existingBinding.expectedMinor
-        ) {
-          finalOutcome = 'failed';
-          note = 'Webhook amount mismatch against bound invoice.';
-        } else if (
-          normalized.currency &&
-          normalized.currency !== existingBinding.currency.toUpperCase()
-        ) {
-          finalOutcome = 'failed';
-          note = 'Webhook currency mismatch against bound invoice.';
-        } else {
-          ledger.upsertReferenceBinding({
-            ...existingBinding,
-            verificationStatus: finalOutcome,
-            providerTransactionId:
-              normalized.providerTransactionId || existingBinding.providerTransactionId,
-            updatedAt: new Date().toISOString(),
-          });
-        }
-      }
-
-      ledger.recordWebhookEvent({
-        idempotencyKey: `flutterwave:${normalized.eventId}`,
-        provider: 'flutterwave',
-        eventId: normalized.eventId,
-        eventType: normalized.eventType,
-        reference: normalized.reference,
-        invoiceId: existingBinding?.invoiceId,
-        organizationId: existingBinding?.organizationId,
-        outcome: finalOutcome,
-        processedAt: new Date().toISOString(),
-        note,
-      });
-
-      res.status(200).json({
-        received: true,
-        duplicate: false,
-        provider: 'flutterwave',
-        eventId: normalized.eventId,
-        outcome: finalOutcome,
-      });
+      res.status(200).json(result);
       return;
     }
 
@@ -1385,67 +1798,18 @@ STRICT INTEGRITY RULES:
           webhookSecret
         );
       } catch {
-        logSecurityEvent('webhook_invalid_signature', { provider: 'stripe' });
+        logStructured('warn', 'webhook_invalid_signature', { provider: 'stripe' });
         res.status(401).json({ error: 'Invalid Stripe webhook signature.' });
         return;
       }
 
       const normalized = normalizeStripeWebhookEvent(stripeEvent);
-      const existingEvent = ledger.hasProcessedWebhook('stripe', normalized.eventId);
-      if (existingEvent) {
-        res.status(200).json({
-          received: true,
-          duplicate: true,
-          eventId: normalized.eventId,
-          outcome: existingEvent.outcome,
-        });
+      const result = await paymentRepo.processWebhook({ provider: 'stripe', normalized });
+      if (result.retryable) {
+        res.status(500).json(result);
         return;
       }
-
-      const existingBinding = normalized.reference
-        ? ledger.getReferenceBinding('stripe', normalized.reference)
-        : null;
-      let finalOutcome = normalized.outcome;
-      let note = `Processed Stripe ${normalized.eventType} event.`;
-      if (existingBinding) {
-        if (
-          finalOutcome === 'verified' &&
-          normalized.amountMinor !== undefined &&
-          normalized.amountMinor !== existingBinding.expectedMinor
-        ) {
-          finalOutcome = 'failed';
-          note = 'Stripe webhook amount mismatch against bound invoice.';
-        } else {
-          ledger.upsertReferenceBinding({
-            ...existingBinding,
-            verificationStatus: finalOutcome,
-            providerTransactionId:
-              normalized.providerTransactionId || existingBinding.providerTransactionId,
-            updatedAt: new Date().toISOString(),
-          });
-        }
-      }
-
-      ledger.recordWebhookEvent({
-        idempotencyKey: `stripe:${normalized.eventId}`,
-        provider: 'stripe',
-        eventId: normalized.eventId,
-        eventType: normalized.eventType,
-        reference: normalized.reference,
-        invoiceId: normalized.invoiceId || existingBinding?.invoiceId,
-        organizationId: normalized.organizationId || existingBinding?.organizationId,
-        outcome: finalOutcome,
-        processedAt: new Date().toISOString(),
-        note,
-      });
-
-      res.status(200).json({
-        received: true,
-        duplicate: false,
-        provider: 'stripe',
-        eventId: normalized.eventId,
-        outcome: finalOutcome,
-      });
+      res.status(200).json(result);
       return;
     }
 
@@ -1454,7 +1818,9 @@ STRICT INTEGRITY RULES:
 
   // Global safe JSON error handler (never expose stack traces to clients)
   app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
-    console.error('Unhandled server error:', err instanceof Error ? err.message : 'Unknown error');
+    logStructured('error', 'unhandled_server_error', {
+      message: sanitizeErrorMessage(err, 'Unknown internal error'),
+    });
     if (!res.headersSent) {
       res.status(500).json({ error: 'An internal server error occurred.' });
     }

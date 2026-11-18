@@ -1,5 +1,11 @@
 import type { Request, Response, NextFunction } from 'express';
 import { getFirebaseConfig, getFirestoreDoc } from './firestoreRest.ts';
+import {
+  getAdminAuth,
+  isPermissionOrCredentialError,
+  type AdminFirestoreAdapter,
+} from './firebaseAdmin.ts';
+import { sanitizeErrorMessage } from './logger.ts';
 
 export type UserRole = 'SUPER_ADMIN' | 'PROMOTER' | 'ARTIST';
 
@@ -18,6 +24,7 @@ export interface ServerAuthSession {
   role: UserRole | null;
   isSuperAdmin: boolean;
   isBootstrapAdmin: boolean;
+  needsTokenRefresh?: boolean;
   onboardingCompleted: boolean;
   organizationId: string;
   capabilities: {
@@ -32,6 +39,18 @@ export interface ServerAuthSession {
 export interface AuthenticatedRequest extends Request {
   authSession?: ServerAuthSession;
   rawBody?: Buffer;
+}
+
+export interface AuthClaimManager {
+  setCustomUserClaims(uid: string, claims: Record<string, unknown>): Promise<void>;
+}
+
+export function createFirebaseAdminClaimManager(): AuthClaimManager {
+  return {
+    async setCustomUserClaims(uid: string, claims: Record<string, unknown>): Promise<void> {
+      await getAdminAuth().setCustomUserClaims(uid, claims);
+    },
+  };
 }
 
 export function getServerBootstrapAdminEmails(): Set<string> {
@@ -97,9 +116,36 @@ export async function verifyFirebaseIdToken(idToken: string): Promise<VerifiedFi
   };
 }
 
+export async function syncRoleCustomClaims(
+  uid: string,
+  role: UserRole,
+  claimManager: AuthClaimManager
+): Promise<{ synced: boolean; reason?: string }> {
+  try {
+    await claimManager.setCustomUserClaims(uid, {
+      superAdmin: role === 'SUPER_ADMIN',
+      role,
+    });
+    return { synced: true };
+  } catch (err) {
+    if (isPermissionOrCredentialError(err)) {
+      return {
+        synced: false,
+        reason:
+          'Firebase Auth Admin IAM permission unavailable in this environment (Starter Tier restriction).',
+      };
+    }
+    return {
+      synced: false,
+      reason: sanitizeErrorMessage(err, 'Unable to sync custom claims.'),
+    };
+  }
+}
+
 export async function resolveServerSession(
   identity: VerifiedFirebaseIdentity,
-  idToken: string
+  idToken: string,
+  options?: { adminDb?: AdminFirestoreAdapter }
 ): Promise<ServerAuthSession> {
   const bootstrapEligible = identity.emailVerified && isBootstrapAdminEmail(identity.email);
   const claimSuperAdmin =
@@ -110,6 +156,14 @@ export async function resolveServerSession(
     userDoc = await getFirestoreDoc('users', identity.uid, idToken);
   } catch {
     userDoc = null;
+  }
+
+  if (!userDoc && options?.adminDb) {
+    try {
+      userDoc = await options.adminDb.getDoc('users', identity.uid);
+    } catch {
+      userDoc = null;
+    }
   }
 
   const storedRole =
@@ -124,6 +178,7 @@ export async function resolveServerSession(
 
   const isSuperAdmin = resolvedRole === 'SUPER_ADMIN' || claimSuperAdmin || bootstrapEligible;
   const isPromoterOrAdmin = isSuperAdmin || resolvedRole === 'PROMOTER';
+  const needsTokenRefresh = isSuperAdmin && identity.customClaims.superAdmin !== true;
 
   return {
     uid: identity.uid,
@@ -133,6 +188,7 @@ export async function resolveServerSession(
     role: resolvedRole,
     isSuperAdmin,
     isBootstrapAdmin: bootstrapEligible,
+    needsTokenRefresh,
     onboardingCompleted: Boolean(userDoc?.onboardingCompleted),
     organizationId: typeof userDoc?.organizationId === 'string' ? userDoc.organizationId : '',
     capabilities: {

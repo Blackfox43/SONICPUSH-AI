@@ -1,6 +1,4 @@
 import crypto from 'crypto';
-import fs from 'fs';
-import path from 'path';
 import Stripe from 'stripe';
 
 export type PaymentProvider = 'paystack' | 'flutterwave' | 'stripe' | 'manual_transfer';
@@ -16,7 +14,6 @@ export type CurrencyCode = 'NGN' | 'USD' | 'GBP' | 'EUR';
 
 export function toMinorUnits(amount: number, currency: CurrencyCode): number {
   if (!Number.isFinite(amount) || amount < 0) return -1;
-  // NGN, USD, GBP, EUR all use 100 minor units per major unit
   switch (currency) {
     case 'NGN':
     case 'USD':
@@ -32,137 +29,6 @@ export function timingSafeEqualStr(a: string, b: string): boolean {
   const bufB = Buffer.from(b, 'utf8');
   if (bufA.length !== bufB.length) return false;
   return crypto.timingSafeEqual(bufA, bufB);
-}
-
-export interface ServerInvoiceRecord {
-  id: string;
-  organizationId: string;
-  ownerId: string;
-  assignedUserIds?: string[];
-  clientName: string;
-  currency: CurrencyCode;
-  amount: number;
-  status: string;
-}
-
-export interface ReferenceBindingRecord {
-  bindingKey: string; // `${provider}:${reference}`
-  provider: PaymentProvider;
-  reference: string;
-  invoiceId: string;
-  organizationId: string;
-  currency: CurrencyCode;
-  expectedMinor: number;
-  verificationStatus: PaymentVerificationStatus;
-  providerTransactionId?: string;
-  updatedAt: string;
-}
-
-export interface WebhookEventRecord {
-  idempotencyKey: string; // `${provider}:${eventId}`
-  provider: PaymentProvider;
-  eventId: string;
-  eventType: string;
-  reference: string;
-  invoiceId?: string;
-  organizationId?: string;
-  outcome: PaymentVerificationStatus;
-  processedAt: string;
-  note?: string;
-}
-
-interface LedgerSnapshot {
-  webhookEvents: Record<string, WebhookEventRecord>;
-  referenceBindings: Record<string, ReferenceBindingRecord>;
-}
-
-export class PaymentLedgerStore {
-  private readonly filePath: string | null;
-  private data: LedgerSnapshot = { webhookEvents: {}, referenceBindings: {} };
-
-  constructor(filePath?: string) {
-    if (filePath === ':memory:') {
-      this.filePath = null;
-    } else {
-      this.filePath =
-        filePath || path.resolve(process.cwd(), '.sonicpush_payment_ledger.json');
-      this.loadFromDisk();
-    }
-  }
-
-  private loadFromDisk(): void {
-    if (!this.filePath) return;
-    try {
-      if (fs.existsSync(this.filePath)) {
-        const raw = fs.readFileSync(this.filePath, 'utf-8');
-        const parsed = JSON.parse(raw) as Partial<LedgerSnapshot>;
-        this.data = {
-          webhookEvents: parsed.webhookEvents || {},
-          referenceBindings: parsed.referenceBindings || {},
-        };
-      }
-    } catch {
-      this.data = { webhookEvents: {}, referenceBindings: {} };
-    }
-  }
-
-  private saveToDisk(): void {
-    if (!this.filePath) return;
-    try {
-      fs.writeFileSync(this.filePath, JSON.stringify(this.data, null, 2), 'utf-8');
-    } catch {
-      // Non-fatal in read-only filesystem environments
-    }
-  }
-
-  hasProcessedWebhook(provider: PaymentProvider, eventId: string): WebhookEventRecord | null {
-    const key = `${provider}:${eventId}`;
-    return this.data.webhookEvents[key] || null;
-  }
-
-  recordWebhookEvent(record: WebhookEventRecord): void {
-    this.data.webhookEvents[record.idempotencyKey] = record;
-    this.saveToDisk();
-  }
-
-  getReferenceBinding(provider: PaymentProvider, reference: string): ReferenceBindingRecord | null {
-    return this.data.referenceBindings[`${provider}:${reference}`] || null;
-  }
-
-  checkReferenceConflict(
-    provider: PaymentProvider,
-    reference: string,
-    invoiceId: string,
-    organizationId: string
-  ): string | null {
-    const existing = this.getReferenceBinding(provider, reference);
-    if (!existing) return null;
-    if (existing.organizationId !== organizationId) {
-      return 'Payment reference is already bound to a different organization.';
-    }
-    if (existing.invoiceId !== invoiceId) {
-      return 'Payment reference is already bound to a different invoice and cannot be reused.';
-    }
-    return null;
-  }
-
-  upsertReferenceBinding(record: ReferenceBindingRecord): void {
-    this.data.referenceBindings[record.bindingKey] = record;
-    this.saveToDisk();
-  }
-
-  listOrganizationRecords(organizationId: string): {
-    bindings: ReferenceBindingRecord[];
-    webhooks: WebhookEventRecord[];
-  } {
-    const bindings = Object.values(this.data.referenceBindings).filter(
-      (b) => b.organizationId === organizationId
-    );
-    const webhooks = Object.values(this.data.webhookEvents).filter(
-      (w) => w.organizationId === organizationId
-    );
-    return { bindings, webhooks };
-  }
 }
 
 const EPHEMERAL_ATTESTATION_KEY = crypto.randomBytes(32).toString('hex');
@@ -201,7 +67,10 @@ export interface ProviderVerificationResult {
   message: string;
 }
 
-export type FetchLike = (input: string, init?: RequestInit) => Promise<{
+export type FetchLike = (
+  input: string,
+  init?: RequestInit
+) => Promise<{
   ok: boolean;
   status: number;
   json: () => Promise<unknown>;
@@ -610,10 +479,16 @@ export interface NormalizedWebhookOutcome {
   failureReason?: string;
 }
 
-export function normalizePaystackWebhookPayload(payload: Record<string, unknown>): NormalizedWebhookOutcome | null {
+export function normalizePaystackWebhookPayload(
+  payload: Record<string, unknown>
+): NormalizedWebhookOutcome | null {
   const event = typeof payload.event === 'string' ? payload.event : '';
-  const data = (payload.data && typeof payload.data === 'object' ? payload.data : {}) as Record<string, unknown>;
-  const metadata = (data.metadata && typeof data.metadata === 'object' ? data.metadata : {}) as Record<string, unknown>;
+  const data = (
+    payload.data && typeof payload.data === 'object' ? payload.data : {}
+  ) as Record<string, unknown>;
+  const metadata = (
+    data.metadata && typeof data.metadata === 'object' ? data.metadata : {}
+  ) as Record<string, unknown>;
   const reference = typeof data.reference === 'string' ? data.reference : '';
   const txId = data.id !== undefined ? String(data.id) : '';
   const eventId = txId ? `${event}:${txId}` : `${event}:${reference}`;
@@ -634,14 +509,22 @@ export function normalizePaystackWebhookPayload(payload: Record<string, unknown>
     amountMinor: typeof data.amount === 'number' ? Math.round(data.amount) : undefined,
     currency: typeof data.currency === 'string' ? data.currency.toUpperCase() : undefined,
     invoiceId: typeof metadata.invoiceId === 'string' ? metadata.invoiceId : undefined,
-    organizationId: typeof metadata.organizationId === 'string' ? metadata.organizationId : undefined,
+    organizationId:
+      typeof metadata.organizationId === 'string' ? metadata.organizationId : undefined,
     failureReason: typeof data.gateway_response === 'string' ? data.gateway_response : undefined,
   };
 }
 
-export function normalizeFlutterwaveWebhookPayload(payload: Record<string, unknown>): NormalizedWebhookOutcome | null {
+export function normalizeFlutterwaveWebhookPayload(
+  payload: Record<string, unknown>
+): NormalizedWebhookOutcome | null {
   const event = typeof payload.event === 'string' ? payload.event : '';
-  const data = (payload.data && typeof payload.data === 'object' ? payload.data : {}) as Record<string, unknown>;
+  const data = (
+    payload.data && typeof payload.data === 'object' ? payload.data : {}
+  ) as Record<string, unknown>;
+  const meta = (
+    data.meta && typeof data.meta === 'object' ? data.meta : {}
+  ) as Record<string, unknown>;
   const reference = typeof data.tx_ref === 'string' ? data.tx_ref : '';
   const txId = data.id !== undefined ? String(data.id) : '';
   const eventId = txId ? `${event}:${txId}` : `${event}:${reference}`;
@@ -661,13 +544,18 @@ export function normalizeFlutterwaveWebhookPayload(payload: Record<string, unkno
     outcome,
     amountMinor: typeof data.amount === 'number' ? Math.round(data.amount * 100) : undefined,
     currency: typeof data.currency === 'string' ? data.currency.toUpperCase() : undefined,
-    failureReason: typeof data.processor_response === 'string' ? data.processor_response : undefined,
+    invoiceId: typeof meta.invoiceId === 'string' ? meta.invoiceId : undefined,
+    organizationId: typeof meta.organizationId === 'string' ? meta.organizationId : undefined,
+    failureReason:
+      typeof data.processor_response === 'string' ? data.processor_response : undefined,
   };
 }
 
 export function normalizeStripeWebhookEvent(event: Stripe.Event): NormalizedWebhookOutcome {
   const obj = event.data.object as unknown as Record<string, unknown>;
-  const metadata = (obj.metadata && typeof obj.metadata === 'object' ? obj.metadata : {}) as Record<string, unknown>;
+  const metadata = (
+    obj.metadata && typeof obj.metadata === 'object' ? obj.metadata : {}
+  ) as Record<string, unknown>;
 
   let reference = '';
   if (typeof obj.payment_intent === 'string') reference = obj.payment_intent;
@@ -679,7 +567,10 @@ export function normalizeStripeWebhookEvent(event: Stripe.Event): NormalizedWebh
     reference = typeof obj.id === 'string' ? obj.id : reference;
   } else if (event.type === 'payment_intent.succeeded') {
     outcome = 'verified';
-  } else if (event.type === 'payment_intent.payment_failed' || event.type === 'checkout.session.expired') {
+  } else if (
+    event.type === 'payment_intent.payment_failed' ||
+    event.type === 'checkout.session.expired'
+  ) {
     outcome = 'failed';
   } else if (event.type === 'charge.refunded') {
     outcome = 'refunded';
@@ -705,6 +596,7 @@ export function normalizeStripeWebhookEvent(event: Stripe.Event): NormalizedWebh
     amountMinor: amountVal,
     currency: typeof obj.currency === 'string' ? obj.currency.toUpperCase() : undefined,
     invoiceId: typeof metadata.invoiceId === 'string' ? metadata.invoiceId : undefined,
-    organizationId: typeof metadata.organizationId === 'string' ? metadata.organizationId : undefined,
+    organizationId:
+      typeof metadata.organizationId === 'string' ? metadata.organizationId : undefined,
   };
 }

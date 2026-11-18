@@ -263,7 +263,7 @@ test('Firestore Emulator Security Rules Suite (8 Scenarios)', async () => {
   );
   await assertFails(deleteDoc(doc(promoterADb, 'invoices', 'inv_alpha_1')));
 
-  // 8. Authorized admin operations: Super Admin can reconcile verified payment & paid invoice
+  // 8. Authorized admin operations: Bootstrap Super Admin can reconcile verified payment & paid invoice
   await assertSucceeds(
     updateDoc(doc(adminDb, 'payments', 'pay_alpha_1'), {
       verificationStatus: 'verified',
@@ -275,6 +275,146 @@ test('Firestore Emulator Security Rules Suite (8 Scenarios)', async () => {
     updateDoc(doc(adminDb, 'invoices', 'inv_alpha_1'), {
       status: 'paid',
       verifiedPaymentRef: 'PSK_REF_1',
+      updatedAt: serverTimestamp(),
+    })
+  );
+
+  // 9. Promoted Super Admin parity: non-bootstrap user with synced custom claims + role == SUPER_ADMIN has full admin access
+  await env.withSecurityRulesDisabled(async (ctx) => {
+    const db = ctx.firestore();
+    const now = serverTimestamp();
+    await setDoc(doc(db, 'users', 'promoted_admin'), {
+      uid: 'promoted_admin',
+      ownerId: 'promoted_admin',
+      email: 'promoted-admin@sonicpush.ng',
+      displayName: 'Promoted Admin',
+      role: 'SUPER_ADMIN',
+      organizationId: 'org_agency',
+      preferredCurrency: 'NGN',
+      onboardingCompleted: true,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await setDoc(doc(db, 'payment_webhook_events', 'paystack_evt_1'), {
+      id: 'paystack_evt_1',
+      idempotencyKey: 'paystack:evt_1',
+      provider: 'paystack',
+      eventId: 'evt_1',
+      eventType: 'charge.success',
+      outcome: 'verified',
+      reconciliationStatus: 'reconciled',
+      retryCount: 0,
+      processedAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    });
+  });
+
+  const promotedAdminDb = env
+    .authenticatedContext('promoted_admin', {
+      email: 'promoted-admin@sonicpush.ng',
+      email_verified: true,
+      superAdmin: true,
+      role: 'SUPER_ADMIN',
+    })
+    .firestore();
+
+  await assertSucceeds(getDoc(doc(promotedAdminDb, 'invoices', 'inv_alpha_1')));
+  await assertSucceeds(getDoc(doc(promotedAdminDb, 'payment_webhook_events', 'paystack_evt_1')));
+
+  // 10. Server-managed collections: clients cannot write bindings/webhooks/quotas/cleanup logs or read ai_rate_limits
+  await assertFails(
+    setDoc(doc(promoterADb, 'payment_reference_bindings', 'forged_bind'), {
+      id: 'forged_bind',
+      provider: 'paystack',
+      reference: 'FORGED',
+    })
+  );
+  await assertFails(
+    setDoc(doc(promoterADb, 'payment_webhook_events', 'forged_wh'), {
+      id: 'forged_wh',
+      provider: 'paystack',
+    })
+  );
+  await assertFails(
+    setDoc(doc(promoterADb, 'ai_rate_limits', 'forged_rl'), {
+      id: 'forged_rl',
+      count: 0,
+    })
+  );
+  await assertFails(getDoc(doc(promoterADb, 'payment_webhook_events', 'paystack_evt_1')));
+  await assertFails(getDoc(doc(promotedAdminDb, 'ai_rate_limits', 'forged_rl')));
+  await assertFails(
+    setDoc(doc(promoterADb, 'audio_cleanup_logs', 'forged_clean'), {
+      id: 'forged_clean',
+      status: 'deleted',
+    })
+  );
+
+  // 11. Song Phase 2 retention metadata validation
+  await env.withSecurityRulesDisabled(async (ctx) => {
+    const db = ctx.firestore();
+    const now = serverTimestamp();
+    await setDoc(doc(db, 'artists', 'art_alpha_1'), {
+      id: 'art_alpha_1',
+      organizationId: 'org_alpha',
+      ownerId: 'promoter_a',
+      assignedUserIds: ['promoter_a'],
+      name: 'Alpha Star',
+      bio: 'Bio',
+      country: 'Nigeria',
+      city: 'Lagos',
+      genre: 'Afrobeats',
+      languages: 'English',
+      targetAudience: 'Global',
+      careerStage: 'Developing',
+      marketingObjectives: 'Growth',
+      archived: false,
+      createdAt: now,
+      updatedAt: now,
+    });
+  });
+
+  await assertSucceeds(
+    setDoc(doc(promoterADb, 'songs', 'song_alpha_valid'), {
+      id: 'song_alpha_valid',
+      organizationId: 'org_alpha',
+      ownerId: 'promoter_a',
+      assignedUserIds: ['promoter_a'],
+      artistId: 'art_alpha_1',
+      artistName: 'Alpha Star',
+      title: 'Midnight Lagos',
+      genre: 'Afrobeats',
+      language: 'English',
+      releaseDate: '2026-06-01',
+      audioStoragePath: 'organizations/org_alpha/audio/1234.mp3',
+      audioUploadedAt: '2026-05-01T00:00:00.000Z',
+      audioRetentionExpiresAt: '2026-08-01T00:00:00.000Z',
+      audioStorageCleanupStatus: 'active',
+      audioProcessed: true,
+      message: 'Summer anthem',
+      moodAndStyle: 'Warm Afro-fusion',
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    })
+  );
+
+  await assertFails(
+    setDoc(doc(promoterADb, 'songs', 'song_alpha_bad_status'), {
+      id: 'song_alpha_bad_status',
+      organizationId: 'org_alpha',
+      ownerId: 'promoter_a',
+      assignedUserIds: ['promoter_a'],
+      artistId: 'art_alpha_1',
+      artistName: 'Alpha Star',
+      title: 'Invalid Status',
+      genre: 'Afrobeats',
+      language: 'English',
+      releaseDate: '2026-06-01',
+      audioStorageCleanupStatus: 'forged_status',
+      audioProcessed: false,
+      message: 'Test',
+      moodAndStyle: 'Test',
+      createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
     })
   );

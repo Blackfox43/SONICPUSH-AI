@@ -1,10 +1,9 @@
 import React, { useState } from 'react';
-import { Upload, Sparkles, CheckCircle2, AlertCircle, Trash2, Music2 } from 'lucide-react';
-import { ref, uploadBytes, deleteObject } from 'firebase/storage';
+import { Upload, Sparkles, CheckCircle2, AlertCircle, Trash2, Music2, Volume2 } from 'lucide-react';
 import { useWorkspace } from '../../context/WorkspaceContext';
 import { useToast } from '../ToastProvider';
-import { postFormApi } from '../../lib/api';
-import { clampStr, createScopedDoc, deleteScopedDoc, makeDocId, storage } from '../../lib/firebase';
+import { deleteJsonApi, fetchAuthorizedBlob, getJsonApi, postFormApi } from '../../lib/api';
+import { clampStr, createScopedDoc, deleteScopedDoc, makeDocId } from '../../lib/firebase';
 import type { Song, SongIntelligenceResult } from '../../types/sonicpush';
 
 export const SongIntelligenceView: React.FC = () => {
@@ -25,6 +24,8 @@ export const SongIntelligenceView: React.FC = () => {
 
   const [analyzing, setAnalyzing] = useState(false);
   const [selectedSong, setSelectedSong] = useState<Song | null>(songs[0] || null);
+  const [audioPreviewUrl, setAudioPreviewUrl] = useState<string | null>(null);
+  const [loadingAudioUrl, setLoadingAudioUrl] = useState(false);
 
   const handleAnalyzeAndSave = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -58,36 +59,20 @@ export const SongIntelligenceView: React.FC = () => {
 
       const aiRes = await postFormApi<
         SongIntelligenceResult & {
+          audioUploaded?: boolean;
           audioFileName?: string;
           audioStoragePath?: string;
           audioMimeType?: string;
           audioSignatureFormat?: string;
+          audioUploadedAt?: string;
           audioRetentionExpiresAt?: string;
+          audioStorageCleanupStatus?: 'active' | 'deleted' | 'cleanup_failed' | 'none';
           latencyMs?: number;
           model?: string;
         }
       >('/api/ai/song-intelligence', formData);
 
       void logAiUsage('song_intelligence', aiRes.model || 'gemini-4-hydrogen', 'success', aiRes.latencyMs || 0);
-
-      // Private Firebase Storage upload using server-generated UUID path + retention metadata
-      let persistedStoragePath = '';
-      if (audioFile && aiRes.audioStoragePath && aiRes.audioMimeType) {
-        try {
-          const storageRef = ref(storage, aiRes.audioStoragePath);
-          await uploadBytes(storageRef, audioFile, {
-            contentType: aiRes.audioMimeType,
-            customMetadata: {
-              ownerId: user.uid,
-              organizationId: user.organizationId,
-              retentionExpiresAt: aiRes.audioRetentionExpiresAt || '',
-            },
-          });
-          persistedStoragePath = aiRes.audioStoragePath;
-        } catch {
-          // Storage rules or CORS may restrict direct upload; server multimodal analysis already processed audio safely
-        }
-      }
 
       const songId = makeDocId('song');
       const intelligence: SongIntelligenceResult = {
@@ -108,13 +93,19 @@ export const SongIntelligenceView: React.FC = () => {
         releaseDate: clampStr(releaseDate, 40) || 'TBD',
         ...(streamingLink.trim() ? { streamingLink: clampStr(streamingLink, 1024) } : {}),
         ...(aiRes.audioFileName ? { audioFileName: clampStr(aiRes.audioFileName, 240) } : {}),
-        ...(persistedStoragePath ? { audioStoragePath: clampStr(persistedStoragePath, 512) } : {}),
+        ...(aiRes.audioUploaded && aiRes.audioStoragePath
+          ? { audioStoragePath: clampStr(aiRes.audioStoragePath, 512) }
+          : {}),
         ...(aiRes.audioMimeType ? { audioMimeType: clampStr(aiRes.audioMimeType, 80) } : {}),
         ...(aiRes.audioSignatureFormat
           ? { audioSignatureFormat: clampStr(aiRes.audioSignatureFormat, 40) }
           : {}),
+        ...(aiRes.audioUploadedAt ? { audioUploadedAt: clampStr(aiRes.audioUploadedAt, 40) } : {}),
         ...(aiRes.audioRetentionExpiresAt
           ? { audioRetentionExpiresAt: clampStr(aiRes.audioRetentionExpiresAt, 40) }
+          : {}),
+        ...(aiRes.audioStorageCleanupStatus
+          ? { audioStorageCleanupStatus: aiRes.audioStorageCleanupStatus }
           : {}),
         audioProcessed: Boolean(aiRes.audioProcessed),
         message: clampStr(message, 1500),
@@ -125,6 +116,7 @@ export const SongIntelligenceView: React.FC = () => {
 
       await createScopedDoc('songs', songId, songDoc);
       setSelectedSong({ ...songDoc, id: songId });
+      setAudioPreviewUrl(null);
       setTitle('');
       setLyrics('');
       setAudioFile(null);
@@ -137,18 +129,35 @@ export const SongIntelligenceView: React.FC = () => {
     }
   };
 
+  const handleLoadPrivateAudio = async (song: Song) => {
+    setLoadingAudioUrl(true);
+    try {
+      const res = await getJsonApi<{ mode: 'signed_url' | 'proxy_stream'; url: string }>(
+        `/api/songs/${encodeURIComponent(song.id)}/audio-url`
+      );
+      if (res.mode === 'signed_url') {
+        setAudioPreviewUrl(res.url);
+      } else {
+        const blob = await fetchAuthorizedBlob(res.url);
+        setAudioPreviewUrl(URL.createObjectURL(blob));
+      }
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Unable to load private audio.', 'error');
+    } finally {
+      setLoadingAudioUrl(false);
+    }
+  };
+
   const handleDeleteSong = async (song: Song) => {
     try {
-      if (song.audioStoragePath) {
-        try {
-          await deleteObject(ref(storage, song.audioStoragePath));
-        } catch {
-          // Object may already be expired/deleted or Storage disabled
-        }
+      try {
+        await deleteJsonApi(`/api/songs/${encodeURIComponent(song.id)}`);
+      } catch {
+        await deleteScopedDoc('songs', song.id);
       }
-      await deleteScopedDoc('songs', song.id);
       if (selectedSong?.id === song.id) {
         setSelectedSong(null);
+        setAudioPreviewUrl(null);
       }
       notify(`Removed "${song.title}".`, 'info');
     } catch (err) {
@@ -336,7 +345,10 @@ export const SongIntelligenceView: React.FC = () => {
                     >
                       <button
                         type="button"
-                        onClick={() => setSelectedSong(s)}
+                        onClick={() => {
+                          setSelectedSong(s);
+                          setAudioPreviewUrl(null);
+                        }}
                         className="font-medium flex items-center gap-1.5"
                       >
                         <Music2 className="h-3 w-3 text-[#FF5500]" />
@@ -374,7 +386,7 @@ export const SongIntelligenceView: React.FC = () => {
                       {activeDisplayedSong.title}
                     </h2>
                   </div>
-                  <div className="inline-flex items-center gap-1.5 text-xs font-medium">
+                  <div className="flex flex-wrap items-center gap-3 text-xs font-medium">
                     {activeDisplayedSong.audioProcessed ? (
                       <span className="inline-flex items-center gap-1.5 text-emerald-400">
                         <CheckCircle2 className="h-4 w-4" />
@@ -386,8 +398,26 @@ export const SongIntelligenceView: React.FC = () => {
                         Metadata & Lyrics Only (No Audio File)
                       </span>
                     )}
+                    {activeDisplayedSong.audioStoragePath &&
+                      activeDisplayedSong.audioStorageCleanupStatus !== 'deleted' && (
+                        <button
+                          type="button"
+                          disabled={loadingAudioUrl}
+                          onClick={() => void handleLoadPrivateAudio(activeDisplayedSong)}
+                          className="inline-flex items-center gap-1.5 rounded-lg border border-white/15 bg-[#18181E] px-2.5 py-1 text-xs text-zinc-200 hover:border-[#FF5500] disabled:opacity-50"
+                        >
+                          <Volume2 className="h-3.5 w-3.5 text-[#FF5500]" />
+                          {loadingAudioUrl ? 'Authorizing...' : 'Load Private Audio'}
+                        </button>
+                      )}
                   </div>
                 </div>
+
+                {audioPreviewUrl && (
+                  <div className="rounded-lg border border-white/10 bg-[#18181E] p-3">
+                    <audio controls src={audioPreviewUrl} className="w-full h-9" />
+                  </div>
+                )}
 
                 {/* Verified Observations */}
                 <div className="rounded-lg border border-emerald-500/25 bg-emerald-950/15 p-4 space-y-2">

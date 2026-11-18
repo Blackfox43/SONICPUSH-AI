@@ -180,7 +180,7 @@ service cloud.firestore {
 
     function isValidSong(data) {
       return data.keys().hasAll(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'artistId', 'artistName', 'title', 'genre', 'language', 'releaseDate', 'audioProcessed', 'message', 'moodAndStyle', 'createdAt', 'updatedAt']) &&
-             data.keys().hasOnly(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'artistId', 'artistName', 'title', 'genre', 'language', 'releaseDate', 'streamingLink', 'audioFileName', 'audioStorageUrl', 'audioStoragePath', 'audioMimeType', 'audioSignatureFormat', 'audioRetentionExpiresAt', 'audioProcessed', 'message', 'moodAndStyle', 'lyrics', 'intelligence', 'createdAt', 'updatedAt']) &&
+             data.keys().hasOnly(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'artistId', 'artistName', 'title', 'genre', 'language', 'releaseDate', 'streamingLink', 'audioFileName', 'audioStorageUrl', 'audioStoragePath', 'audioMimeType', 'audioSignatureFormat', 'audioUploadedAt', 'audioRetentionExpiresAt', 'audioStorageCleanupStatus', 'audioDeletedAt', 'audioCleanupError', 'audioProcessed', 'message', 'moodAndStyle', 'lyrics', 'intelligence', 'createdAt', 'updatedAt']) &&
              isValidId(data.artistId) &&
              data.artistName is string && data.artistName.size() <= 140 &&
              data.title is string && data.title.size() >= 1 && data.title.size() <= 180 &&
@@ -193,7 +193,11 @@ service cloud.firestore {
              (!('audioStoragePath' in data) || (data.audioStoragePath is string && data.audioStoragePath.size() <= 512)) &&
              (!('audioMimeType' in data) || (data.audioMimeType is string && data.audioMimeType.size() <= 80)) &&
              (!('audioSignatureFormat' in data) || (data.audioSignatureFormat is string && data.audioSignatureFormat.size() <= 40)) &&
+             (!('audioUploadedAt' in data) || (data.audioUploadedAt is string && data.audioUploadedAt.size() <= 40)) &&
              (!('audioRetentionExpiresAt' in data) || (data.audioRetentionExpiresAt is string && data.audioRetentionExpiresAt.size() <= 40)) &&
+             (!('audioStorageCleanupStatus' in data) || data.audioStorageCleanupStatus in ['active', 'deleted', 'cleanup_failed', 'none']) &&
+             (!('audioDeletedAt' in data) || (data.audioDeletedAt is string && data.audioDeletedAt.size() <= 40)) &&
+             (!('audioCleanupError' in data) || (data.audioCleanupError is string && data.audioCleanupError.size() <= 400)) &&
              data.audioProcessed is bool &&
              data.message is string && data.message.size() <= 1500 &&
              data.moodAndStyle is string && data.moodAndStyle.size() <= 800 &&
@@ -560,7 +564,7 @@ service cloud.firestore {
       allow update: if isVerified() && isValidId(songId) && isValidSong(incoming()) && hasImmutableScopeFields() &&
                        incoming().artistId == existing().artistId && (
         isSuperAdmin() ||
-        (isOwnerOrAssignedExisting() && incoming().diff(existing()).affectedKeys().hasOnly(['artistName', 'title', 'genre', 'language', 'releaseDate', 'streamingLink', 'audioFileName', 'audioStorageUrl', 'audioStoragePath', 'audioMimeType', 'audioSignatureFormat', 'audioRetentionExpiresAt', 'audioProcessed', 'message', 'moodAndStyle', 'lyrics', 'intelligence', 'assignedUserIds', 'updatedAt']))
+        (isOwnerOrAssignedExisting() && incoming().diff(existing()).affectedKeys().hasOnly(['artistName', 'title', 'genre', 'language', 'releaseDate', 'streamingLink', 'audioFileName', 'audioStorageUrl', 'audioStoragePath', 'audioMimeType', 'audioSignatureFormat', 'audioUploadedAt', 'audioRetentionExpiresAt', 'audioStorageCleanupStatus', 'audioProcessed', 'message', 'moodAndStyle', 'lyrics', 'intelligence', 'assignedUserIds', 'updatedAt']))
       );
       allow delete: if isValidId(songId) && (isSuperAdmin() || (isVerified() && existing().ownerId == request.auth.uid));
     }
@@ -769,6 +773,38 @@ service cloud.firestore {
       allow get: if isSuperAdmin() && isValidId(logId);
       allow list: if isVerified() && hasAdminListAccess();
       allow create: if isSuperAdmin() && isValidAdminAuditLog(incoming()) && hasValidCreateScope(logId);
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    match /payment_reference_bindings/{bindingId} {
+      allow get: if isSuperAdmin() && isValidId(bindingId);
+      allow list: if isVerified() && hasAdminListAccess();
+      allow create: if false;
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    match /payment_webhook_events/{eventId} {
+      allow get: if isSuperAdmin() && isValidId(eventId);
+      allow list: if isVerified() && hasAdminListAccess();
+      allow create: if false;
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    match /ai_rate_limits/{limitId} {
+      allow get: if false;
+      allow list: if false;
+      allow create: if false;
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    match /audio_cleanup_logs/{logId} {
+      allow get: if isSuperAdmin() && isValidId(logId);
+      allow list: if isVerified() && hasAdminListAccess();
+      allow create: if false;
       allow update: if false;
       allow delete: if false;
     }

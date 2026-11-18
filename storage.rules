@@ -16,6 +16,7 @@ service firebase.storage {
                      (
                        (resource != null && resource.metadata != null && resource.metadata.ownerId == request.auth.uid && resource.metadata.organizationId == orgId) ||
                        request.auth.token.superAdmin == true ||
+                       request.auth.token.role == 'SUPER_ADMIN' ||
                        request.auth.token.email == 'emma432cent@gmail.com'
                      );
 
@@ -36,6 +37,7 @@ service firebase.storage {
                        (
                          (resource != null && resource.metadata != null && resource.metadata.ownerId == request.auth.uid) ||
                          request.auth.token.superAdmin == true ||
+                         request.auth.token.role == 'SUPER_ADMIN' ||
                          request.auth.token.email == 'emma432cent@gmail.com'
                        );
     }

@@ -67,3 +67,33 @@ export async function postFormApi<TResponse>(
   }
   return data;
 }
+
+export async function deleteJsonApi<TResponse>(url: string): Promise<TResponse> {
+  const authHeaders = await getAuthHeaders();
+  const res = await fetch(url, {
+    method: 'DELETE',
+    headers: {
+      ...authHeaders,
+    },
+  });
+
+  const data = (await res.json()) as TResponse & { error?: string };
+  if (!res.ok) {
+    throw new Error(data.error || `Request failed with status ${res.status}`);
+  }
+  return data;
+}
+
+export async function fetchAuthorizedBlob(url: string): Promise<Blob> {
+  const authHeaders = await getAuthHeaders();
+  const res = await fetch(url, {
+    method: 'GET',
+    headers: {
+      ...authHeaders,
+    },
+  });
+  if (!res.ok) {
+    throw new Error(`Unable to fetch protected audio (${res.status})`);
+  }
+  return res.blob();
+}

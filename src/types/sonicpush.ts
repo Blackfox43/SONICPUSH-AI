@@ -22,6 +22,8 @@ export interface ServerAuthSession {
   role: UserRole | null;
   isSuperAdmin: boolean;
   isBootstrapAdmin: boolean;
+  needsTokenRefresh?: boolean;
+  claimsSynced?: boolean;
   onboardingCompleted: boolean;
   organizationId: string;
   capabilities: {
@@ -111,7 +113,11 @@ export interface Song {
   audioStoragePath?: string;
   audioMimeType?: string;
   audioSignatureFormat?: string;
+  audioUploadedAt?: string;
   audioRetentionExpiresAt?: string;
+  audioStorageCleanupStatus?: 'active' | 'deleted' | 'cleanup_failed' | 'none';
+  audioDeletedAt?: string;
+  audioCleanupError?: string;
   audioProcessed: boolean;
   message: string;
   moodAndStyle: string;

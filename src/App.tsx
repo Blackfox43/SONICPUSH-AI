@@ -32,11 +32,18 @@ function SonicPushRoot() {
 
       setLoadingProfile(true);
       try {
-        const [snap, serverSession] = await Promise.all([
+        const [snap, initialSession] = await Promise.all([
           getDoc(doc(db, 'users', fbUser.uid)),
           getJsonApi<ServerAuthSession>('/api/auth/session').catch(() => null),
         ]);
-        setSessionAuth(serverSession);
+        let resolvedSession = initialSession;
+        if (initialSession?.needsTokenRefresh) {
+          await fbUser.getIdToken(true);
+          resolvedSession = await getJsonApi<ServerAuthSession>('/api/auth/session').catch(
+            () => initialSession
+          );
+        }
+        setSessionAuth(resolvedSession);
         if (snap.exists()) {
           setUserProfile(snap.data() as UserProfile);
         } else {

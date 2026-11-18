@@ -85,7 +85,11 @@
         "audioStoragePath": { "type": "string", "maxLength": 512 },
         "audioMimeType": { "type": "string", "maxLength": 80 },
         "audioSignatureFormat": { "type": "string", "maxLength": 40 },
+        "audioUploadedAt": { "type": "string", "maxLength": 40 },
         "audioRetentionExpiresAt": { "type": "string", "maxLength": 40 },
+        "audioStorageCleanupStatus": { "type": "string", "enum": ["active", "deleted", "cleanup_failed", "none"] },
+        "audioDeletedAt": { "type": "string", "maxLength": 40 },
+        "audioCleanupError": { "type": "string", "maxLength": 400 },
         "audioProcessed": { "type": "boolean" },
         "message": { "type": "string", "maxLength": 1500 },
         "moodAndStyle": { "type": "string", "maxLength": 800 },
@@ -492,6 +496,87 @@
         "updatedAt": { "type": "string", "format": "date-time" }
       },
       "required": ["id", "organizationId", "ownerId", "assignedUserIds", "action", "targetUid", "detail", "createdAt", "updatedAt"]
+    },
+    "PaymentReferenceBinding": {
+      "title": "PaymentReferenceBinding",
+      "description": "Server-managed atomic binding enforcing uniqueness of payment provider references across invoices and organizations",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "bindingKey": { "type": "string", "maxLength": 200 },
+        "provider": { "type": "string", "enum": ["paystack", "flutterwave", "stripe", "manual_transfer"] },
+        "reference": { "type": "string", "maxLength": 160 },
+        "invoiceId": { "type": "string", "maxLength": 128 },
+        "organizationId": { "type": "string", "maxLength": 128 },
+        "currency": { "type": "string", "enum": ["NGN", "USD", "GBP", "EUR"] },
+        "expectedMinor": { "type": "number" },
+        "verificationStatus": { "type": "string", "enum": ["pending", "awaiting_provider_integration", "verified", "failed", "refunded", "disputed"] },
+        "providerTransactionId": { "type": "string", "maxLength": 160 },
+        "serverAttestation": { "type": "string", "maxLength": 256 },
+        "createdAt": { "type": "string", "maxLength": 40 },
+        "updatedAt": { "type": "string", "maxLength": 40 }
+      },
+      "required": ["id", "bindingKey", "provider", "reference", "invoiceId", "organizationId", "currency", "expectedMinor", "verificationStatus", "updatedAt"]
+    },
+    "PaymentWebhookEvent": {
+      "title": "PaymentWebhookEvent",
+      "description": "Server-managed durable webhook idempotency, quarantine, and retry state",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "idempotencyKey": { "type": "string", "maxLength": 200 },
+        "provider": { "type": "string", "enum": ["paystack", "flutterwave", "stripe", "manual_transfer"] },
+        "eventId": { "type": "string", "maxLength": 160 },
+        "eventType": { "type": "string", "maxLength": 100 },
+        "reference": { "type": "string", "maxLength": 160 },
+        "providerTransactionId": { "type": "string", "maxLength": 160 },
+        "invoiceId": { "type": "string", "maxLength": 128 },
+        "organizationId": { "type": "string", "maxLength": 128 },
+        "outcome": { "type": "string", "enum": ["pending", "awaiting_provider_integration", "verified", "failed", "refunded", "disputed"] },
+        "reconciliationStatus": { "type": "string", "enum": ["reconciled", "pending_retry", "quarantined", "ignored"] },
+        "retryCount": { "type": "number" },
+        "lastError": { "type": "string", "maxLength": 400 },
+        "quarantineReason": { "type": "string", "maxLength": 400 },
+        "processedAt": { "type": "string", "maxLength": 40 },
+        "updatedAt": { "type": "string", "maxLength": 40 },
+        "note": { "type": "string", "maxLength": 400 }
+      },
+      "required": ["id", "idempotencyKey", "provider", "eventId", "eventType", "outcome", "reconciliationStatus", "retryCount", "processedAt", "updatedAt"]
+    },
+    "AiRateLimitBucket": {
+      "title": "AiRateLimitBucket",
+      "description": "Server-managed transactional AI quota counter bucket",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "scope": { "type": "string", "enum": ["user_minute", "user_daily", "org_daily", "feature_daily"] },
+        "uid": { "type": "string", "maxLength": 128 },
+        "organizationId": { "type": "string", "maxLength": 128 },
+        "feature": { "type": "string", "maxLength": 64 },
+        "windowKey": { "type": "string", "maxLength": 40 },
+        "count": { "type": "number" },
+        "limit": { "type": "number" },
+        "expiresAt": { "type": "string", "maxLength": 40 },
+        "updatedAt": { "type": "string", "maxLength": 40 }
+      },
+      "required": ["id", "scope", "organizationId", "windowKey", "count", "limit", "expiresAt", "updatedAt"]
+    },
+    "AudioCleanupLog": {
+      "title": "AudioCleanupLog",
+      "description": "Server-managed log of retention cleanup attempts on expired private audio files",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "songId": { "type": "string", "maxLength": 128 },
+        "organizationId": { "type": "string", "maxLength": 128 },
+        "storageObjectPath": { "type": "string", "maxLength": 512 },
+        "status": { "type": "string", "enum": ["deleted", "failed"] },
+        "error": { "type": "string", "maxLength": 400 },
+        "attemptedAt": { "type": "string", "maxLength": 40 },
+        "createdAt": { "type": "string", "maxLength": 40 },
+        "updatedAt": { "type": "string", "maxLength": 40 }
+      },
+      "required": ["id", "songId", "organizationId", "storageObjectPath", "status", "attemptedAt", "createdAt", "updatedAt"]
     }
   },
   "firestore": {
@@ -515,6 +600,10 @@
     "/notifications/{notificationId}": { "schema": { "$ref": "#/entities/Notification" }, "description": "Notifications & reminders" },
     "/ai_usage_logs/{logId}": { "schema": { "$ref": "#/entities/AiUsageLog" }, "description": "Gemini AI usage logs" },
     "/ad_plans/{planId}": { "schema": { "$ref": "#/entities/AdPlan" }, "description": "Advertising campaign plans" },
-    "/admin_audit_logs/{logId}": { "schema": { "$ref": "#/entities/AdminAuditLog" }, "description": "Immutable Super Admin audit log" }
+    "/admin_audit_logs/{logId}": { "schema": { "$ref": "#/entities/AdminAuditLog" }, "description": "Immutable Super Admin audit log" },
+    "/payment_reference_bindings/{bindingId}": { "schema": { "$ref": "#/entities/PaymentReferenceBinding" }, "description": "Server-managed payment reference uniqueness bindings" },
+    "/payment_webhook_events/{eventId}": { "schema": { "$ref": "#/entities/PaymentWebhookEvent" }, "description": "Server-managed webhook idempotency and retry ledger" },
+    "/ai_rate_limits/{limitId}": { "schema": { "$ref": "#/entities/AiRateLimitBucket" }, "description": "Server-managed distributed AI rate-limit counters" },
+    "/audio_cleanup_logs/{logId}": { "schema": { "$ref": "#/entities/AudioCleanupLog" }, "description": "Server-managed retention cleanup logs" }
   }
 }

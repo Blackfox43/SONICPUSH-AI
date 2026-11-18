@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useCallback } from 'react';
-import { CreditCard, ShieldCheck, Plus, RefreshCw, AlertTriangle, CheckCircle2 } from 'lucide-react';
+import { CreditCard, ShieldCheck, Plus, RefreshCw, AlertTriangle, CheckCircle2, Activity, Trash2 } from 'lucide-react';
 import { useWorkspace } from '../../context/WorkspaceContext';
 import { useToast } from '../ToastProvider';
 import { getJsonApi, postJsonApi } from '../../lib/api';
@@ -18,15 +18,68 @@ interface ServerLedgerResponse {
     updatedAt: string;
   }>;
   webhooks: Array<{
+    id?: string;
     idempotencyKey: string;
     provider: string;
     eventId: string;
     eventType: string;
     reference: string;
     outcome: string;
+    reconciliationStatus?: string;
     processedAt: string;
     note?: string;
   }>;
+}
+
+interface AdminDiagnosticsResponse {
+  timestamp: string;
+  providers: {
+    geminiConfigured: boolean;
+    paystackConfigured: boolean;
+    flutterwaveConfigured: boolean;
+    flutterwaveWebhookConfigured: boolean;
+    stripeConfigured: boolean;
+    stripeWebhookConfigured: boolean;
+  };
+  firebaseAdmin: {
+    initialized: boolean;
+    firestoreReady: boolean;
+    storageReady: boolean;
+    authReady: boolean;
+    iamStatus: string;
+    diagnosticNote?: string;
+  };
+  webhookSummary: {
+    totalRecent: number;
+    pendingRetryCount: number;
+    quarantinedCount: number;
+    recentEvents: Array<{
+      id: string;
+      provider: string;
+      eventId: string;
+      eventType: string;
+      reference: string;
+      outcome: string;
+      reconciliationStatus: string;
+      retryCount: number;
+      processedAt: string;
+      note?: string;
+    }>;
+  };
+  audioCleanup: {
+    failedSongsCount: number;
+    recentLogs: Array<{
+      id: string;
+      songId: string;
+      status: string;
+      attemptedAt: string;
+      error?: string;
+    }>;
+  };
+  aiQuota: {
+    mode: string;
+    degradedReason?: string;
+  };
 }
 
 export const PaymentsAdminView: React.FC<{ initialTab?: 'payments' | 'admin' }> = ({
@@ -56,6 +109,9 @@ export const PaymentsAdminView: React.FC<{ initialTab?: 'payments' | 'admin' }> 
   const [transactionId, setTransactionId] = useState('');
   const [verifying, setVerifying] = useState(false);
   const [serverLedger, setServerLedger] = useState<ServerLedgerResponse>({ bindings: [], webhooks: [] });
+  const [diagnostics, setDiagnostics] = useState<AdminDiagnosticsResponse | null>(null);
+  const [runningCleanup, setRunningCleanup] = useState(false);
+  const [retryingEventId, setRetryingEventId] = useState<string | null>(null);
 
   const refreshServerLedger = useCallback(async () => {
     try {
@@ -68,9 +124,22 @@ export const PaymentsAdminView: React.FC<{ initialTab?: 'payments' | 'admin' }> 
     }
   }, [user.organizationId]);
 
+  const refreshAdminDiagnostics = useCallback(async () => {
+    if (!isSuperAdmin) return;
+    try {
+      const diag = await getJsonApi<AdminDiagnosticsResponse>('/api/admin/diagnostics');
+      setDiagnostics(diag);
+    } catch {
+      // Non-blocking
+    }
+  }, [isSuperAdmin]);
+
   useEffect(() => {
     void refreshServerLedger();
-  }, [refreshServerLedger]);
+    if (isSuperAdmin && tab === 'admin') {
+      void refreshAdminDiagnostics();
+    }
+  }, [refreshServerLedger, refreshAdminDiagnostics, isSuperAdmin, tab]);
 
   const handleCreateInvoice = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -194,18 +263,51 @@ export const PaymentsAdminView: React.FC<{ initialTab?: 'payments' | 'admin' }> 
 
   const handleRoleUpdate = async (targetUid: string, role: UserRole) => {
     try {
-      await postJsonApi(`/api/admin/users/${encodeURIComponent(targetUid)}/role`, { role });
-      await createScopedDoc('admin_audit_logs', makeDocId('audit'), {
-        organizationId: user.organizationId,
-        ownerId: user.uid,
-        assignedUserIds: [user.uid],
-        action: 'user_role_updated',
-        targetUid,
-        detail: `Changed role to ${role}`,
-      });
-      notify(`Updated user role to ${role} via server governance endpoint.`, 'success');
+      const res = await postJsonApi<{ ok: boolean; claimsSynced?: boolean; claimsNote?: string }>(
+        `/api/admin/users/${encodeURIComponent(targetUid)}/role`,
+        { role }
+      );
+      notify(
+        res.claimsSynced
+          ? `Updated role to ${role} and synced Auth custom claims.`
+          : `Updated role to ${role}${res.claimsNote ? ` (${res.claimsNote})` : ''}.`,
+        'success'
+      );
+      void refreshAdminDiagnostics();
     } catch (err) {
       notify(err instanceof Error ? err.message : 'Failed to update user role.', 'error');
+    }
+  };
+
+  const handleRetryWebhook = async (eventDocId: string) => {
+    setRetryingEventId(eventDocId);
+    try {
+      await postJsonApi(`/api/payments/webhooks/${encodeURIComponent(eventDocId)}/retry`, {});
+      notify('Webhook reconciliation retried cleanly.', 'success');
+      await Promise.all([refreshAdminDiagnostics(), refreshServerLedger()]);
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Webhook retry failed.', 'error');
+    } finally {
+      setRetryingEventId(null);
+    }
+  };
+
+  const handleRunAudioCleanup = async () => {
+    setRunningCleanup(true);
+    try {
+      const summary = await postJsonApi<{ scanned: number; deleted: number; failed: number }>(
+        '/api/admin/audio/cleanup',
+        { limit: 50 }
+      );
+      notify(
+        `Audio cleanup complete: scanned ${summary.scanned}, deleted ${summary.deleted}, failed ${summary.failed}.`,
+        summary.failed > 0 ? 'info' : 'success'
+      );
+      await refreshAdminDiagnostics();
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Audio retention cleanup failed.', 'error');
+    } finally {
+      setRunningCleanup(false);
     }
   };
 
@@ -306,6 +408,169 @@ export const PaymentsAdminView: React.FC<{ initialTab?: 'payments' | 'admin' }> 
               </tbody>
             </table>
           </div>
+
+          {/* Platform Diagnostics, Webhook Retry & Audio Cleanup */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            <div className="rounded-xl border border-white/10 bg-[#121216] p-4 space-y-3">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Activity className="h-4 w-4 text-[#FF5500]" />
+                  <h2 className="font-display text-sm font-semibold text-white">
+                    System & Provider Readiness
+                  </h2>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => void refreshAdminDiagnostics()}
+                  className="text-xs text-zinc-400 hover:text-white inline-flex items-center gap-1"
+                >
+                  <RefreshCw className="h-3 w-3" />
+                  Refresh
+                </button>
+              </div>
+              {diagnostics ? (
+                <div className="space-y-2 text-xs">
+                  <div className="grid grid-cols-2 gap-2">
+                    <div className="rounded-lg bg-[#18181E] p-2.5">
+                      <p className="text-zinc-400">Admin SDK IAM</p>
+                      <p className="font-mono-tabular text-white mt-0.5">{diagnostics.firebaseAdmin.iamStatus}</p>
+                    </div>
+                    <div className="rounded-lg bg-[#18181E] p-2.5">
+                      <p className="text-zinc-400">AI Quota Limiter</p>
+                      <p className="font-mono-tabular text-white mt-0.5">{diagnostics.aiQuota.mode}</p>
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap gap-2 pt-1">
+                    {[
+                      { label: 'Gemini', ok: diagnostics.providers.geminiConfigured },
+                      { label: 'Paystack', ok: diagnostics.providers.paystackConfigured },
+                      { label: 'Flutterwave', ok: diagnostics.providers.flutterwaveConfigured },
+                      { label: 'Stripe', ok: diagnostics.providers.stripeConfigured },
+                    ].map((p) => (
+                      <span
+                        key={p.label}
+                        className={`rounded-md border px-2 py-1 text-[11px] ${
+                          p.ok
+                            ? 'border-emerald-500/30 bg-emerald-950/20 text-emerald-300'
+                            : 'border-amber-500/30 bg-amber-950/20 text-amber-300'
+                        }`}
+                      >
+                        {p.label}: {p.ok ? 'Configured' : 'Awaiting Credentials'}
+                      </span>
+                    ))}
+                  </div>
+                  {diagnostics.firebaseAdmin.diagnosticNote && (
+                    <p className="text-[11px] text-amber-300/90 leading-relaxed">
+                      {diagnostics.firebaseAdmin.diagnosticNote}
+                    </p>
+                  )}
+                </div>
+              ) : (
+                <p className="text-xs text-zinc-500">Loading platform diagnostics...</p>
+              )}
+            </div>
+
+            <div className="rounded-xl border border-white/10 bg-[#121216] p-4 space-y-3">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Trash2 className="h-4 w-4 text-[#8B5CF6]" />
+                  <h2 className="font-display text-sm font-semibold text-white">
+                    Audio Retention Cleanup
+                  </h2>
+                </div>
+                <button
+                  type="button"
+                  disabled={runningCleanup}
+                  onClick={() => void handleRunAudioCleanup()}
+                  className="px-3 py-1.5 text-xs font-medium rounded-lg bg-[#8B5CF6] text-white hover:bg-[#7C3AED] disabled:opacity-50"
+                >
+                  {runningCleanup ? 'Cleaning...' : 'Run Retention Cleanup'}
+                </button>
+              </div>
+              <p className="text-xs text-zinc-400">
+                Deletes expired private audio files past <code className="font-mono-tabular">AUDIO_RETENTION_DAYS</code> and retries failed deletions.
+                {diagnostics ? ` Failed pending retry: ${diagnostics.audioCleanup.failedSongsCount}.` : ''}
+              </p>
+              {diagnostics && diagnostics.audioCleanup.recentLogs.length > 0 ? (
+                <div className="space-y-1.5 max-h-28 overflow-y-auto text-[11px]">
+                  {diagnostics.audioCleanup.recentLogs.slice(0, 6).map((l) => (
+                    <div key={l.id} className="flex items-center justify-between rounded bg-[#18181E] px-2.5 py-1.5">
+                      <span className="font-mono-tabular text-zinc-300 truncate">{l.songId}</span>
+                      <span className={l.status === 'deleted' ? 'text-emerald-400' : 'text-red-400'}>
+                        {l.status}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="text-[11px] text-zinc-500">No cleanup runs recorded yet.</p>
+              )}
+            </div>
+          </div>
+
+          {diagnostics && diagnostics.webhookSummary.recentEvents.length > 0 && (
+            <div className="rounded-xl border border-white/10 bg-[#121216] overflow-x-auto">
+              <div className="p-4 border-b border-white/10 flex items-center justify-between">
+                <h2 className="font-display text-sm font-semibold text-white">
+                  Recent Payment Webhooks ({diagnostics.webhookSummary.totalRecent})
+                </h2>
+                <span className="text-xs text-zinc-400">
+                  Pending Retry: {diagnostics.webhookSummary.pendingRetryCount} · Quarantined:{' '}
+                  {diagnostics.webhookSummary.quarantinedCount}
+                </span>
+              </div>
+              <table className="w-full text-left border-collapse text-xs">
+                <thead>
+                  <tr className="border-b border-white/10 text-zinc-400">
+                    <th className="py-2.5 px-4">Provider & Event</th>
+                    <th className="py-2.5 px-4">Reference</th>
+                    <th className="py-2.5 px-4">Outcome</th>
+                    <th className="py-2.5 px-4">Reconciliation</th>
+                    <th className="py-2.5 px-4 text-right">Action</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-white/10">
+                  {diagnostics.webhookSummary.recentEvents.map((ev) => (
+                    <tr key={ev.id}>
+                      <td className="py-2.5 px-4">
+                        <span className="uppercase text-white font-medium">{ev.provider}</span>{' '}
+                        <span className="text-zinc-400">{ev.eventType}</span>
+                      </td>
+                      <td className="py-2.5 px-4 font-mono-tabular text-zinc-300">{ev.reference}</td>
+                      <td className="py-2.5 px-4 text-zinc-300">{ev.outcome}</td>
+                      <td className="py-2.5 px-4">
+                        <span
+                          className={
+                            ev.reconciliationStatus === 'reconciled'
+                              ? 'text-emerald-400'
+                              : ev.reconciliationStatus === 'pending_retry'
+                              ? 'text-amber-300'
+                              : 'text-red-400'
+                          }
+                        >
+                          {ev.reconciliationStatus}
+                        </span>
+                      </td>
+                      <td className="py-2.5 px-4 text-right">
+                        {ev.reconciliationStatus === 'pending_retry' ? (
+                          <button
+                            type="button"
+                            disabled={retryingEventId === ev.id}
+                            onClick={() => void handleRetryWebhook(ev.id)}
+                            className="text-[#FF5500] hover:underline disabled:opacity-50"
+                          >
+                            {retryingEventId === ev.id ? 'Retrying...' : 'Retry'}
+                          </button>
+                        ) : (
+                          <span className="text-zinc-500">—</span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
 
           {/* AI Usage Monitor */}
           <div className="rounded-xl border border-white/10 bg-[#121216] overflow-x-auto">

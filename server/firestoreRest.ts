@@ -5,6 +5,7 @@ interface FirebaseAppletConfig {
   apiKey: string;
   projectId: string;
   firestoreDatabaseId?: string;
+  storageBucket?: string;
 }
 
 let cachedConfig: FirebaseAppletConfig | null = null;
