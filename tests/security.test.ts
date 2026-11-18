@@ -46,6 +46,8 @@ interface TestFirestoreController {
   failNextTransactionCount: number;
   failDeleteCounts: Map<string, number>;
   failUpdateCounts: Map<string, number>;
+  failSetCounts: Map<string, number>;
+  failGetCounts: Map<string, number>;
 }
 
 function createInMemoryAdminFirestore(
@@ -57,18 +59,34 @@ function createInMemoryAdminFirestore(
   let txQueue: Promise<unknown> = Promise.resolve();
   const failDeleteCounts = new Map<string, number>();
   const failUpdateCounts = new Map<string, number>();
+  const failSetCounts = new Map<string, number>();
+  const failGetCounts = new Map<string, number>();
 
   const controller: TestFirestoreController = {
     docs,
     failNextTransactionCount: 0,
     failDeleteCounts,
     failUpdateCounts,
+    failSetCounts,
+    failGetCounts,
     adapter: {
       async getDoc(col, id) {
+        const key = `${col}/${id}`;
+        const rem = failGetCounts.get(key) || 0;
+        if (rem > 0) {
+          failGetCounts.set(key, rem - 1);
+          throw new Error(`SIMULATED_FIRESTORE_GET_FAILURE:${key}`);
+        }
         const hit = docs[col]?.[id];
         return hit ? cloneValue(hit) : null;
       },
       async setDoc(col, id, data, merge = false) {
+        const key = `${col}/${id}`;
+        const rem = failSetCounts.get(key) || 0;
+        if (rem > 0) {
+          failSetCounts.set(key, rem - 1);
+          throw new Error(`SIMULATED_FIRESTORE_SET_FAILURE:${key}`);
+        }
         docs[col] = docs[col] || {};
         const clean = cloneValue(data);
         docs[col][id] = merge && docs[col][id] ? { ...docs[col][id], ...clean } : clean;
@@ -196,6 +214,7 @@ function createInMemoryAudioStorage() {
   >();
   let failNextUpload = false;
   const failDeletePaths = new Set<string>();
+  const failMetadataErrors = new Map<string, Error>();
 
   const adapter: AudioStorageAdapter = {
     async uploadPrivateAudio(params) {
@@ -229,6 +248,10 @@ function createInMemoryAudioStorage() {
       return { buffer: Buffer.from(hit.buffer), contentType: hit.contentType };
     },
     async getAudioMetadata(storageObjectPath) {
+      const injectedErr = failMetadataErrors.get(storageObjectPath);
+      if (injectedErr) {
+        throw injectedErr;
+      }
       const hit = objects.get(storageObjectPath);
       if (!hit) return null;
       return {
@@ -293,6 +316,10 @@ function createInMemoryAudioStorage() {
     failDeleteFor(path: string, shouldFail: boolean) {
       if (shouldFail) failDeletePaths.add(path);
       else failDeletePaths.delete(path);
+    },
+    failMetadataFor(path: string, err: Error | null) {
+      if (err) failMetadataErrors.set(path, err);
+      else failMetadataErrors.delete(path);
     },
     seedObject(
       path: string,
@@ -2410,5 +2437,366 @@ test('9. Final Cleanup Reliability: Storage-succeeded Firestore-failed preserves
     assert.ok(envLarge.dbController.docs.songs.song_meta_conflict);
   });
 });
+
+test('10. Storage Safety & Cursor Integrity: metadata lookup errors, missing-object handling, unverified-org block, and mandatory cursor persistence', async () => {
+  const oldIso = '2026-01-01T00:00:00.000Z';
+  const runNow = new Date('2026-05-01T12:00:00.000Z');
+
+  // 10a. DELETE /api/songs/:songId fail-closed on metadata timeout/permission error, unverified org metadata, conflict, and safe 404 missing object
+  const storageApi = createInMemoryAudioStorage();
+  const errPath = 'organizations/org_a/audio/meta-err-song.mp3';
+  const unverifiedPath = 'organizations/org_a/audio/meta-missing-org.mp3';
+  const conflictPath = 'organizations/org_a/audio/meta-conflict-org.mp3';
+  const alreadyGonePath = 'organizations/org_a/audio/already-missing.mp3';
+
+  storageApi.seedObject(errPath, { organizationId: 'org_a', uploadedAt: oldIso });
+  storageApi.seedObject(unverifiedPath, { organizationId: '', uploadedAt: oldIso });
+  storageApi.seedObject(conflictPath, { organizationId: 'org_b', uploadedAt: oldIso });
+  // alreadyGonePath intentionally NOT seeded in Storage -> confirmed missing object!
+
+  storageApi.failMetadataFor(errPath, new Error('ETIMEDOUT: storage metadata lookup timed out'));
+
+  const envApi = buildTestEnvironment({ audioStorage: storageApi });
+  await envApi.dbController.adapter.setDoc('songs', 'song_meta_err', {
+    id: 'song_meta_err',
+    organizationId: 'org_a',
+    ownerId: 'uid_prom_a',
+    assignedUserIds: ['uid_prom_a'],
+    title: 'Metadata Error Song',
+    audioStoragePath: errPath,
+    audioStorageCleanupStatus: 'active',
+  });
+  await envApi.dbController.adapter.setDoc('songs', 'song_unverified_org', {
+    id: 'song_unverified_org',
+    organizationId: 'org_a',
+    ownerId: 'uid_prom_a',
+    assignedUserIds: ['uid_prom_a'],
+    title: 'Unverified Org Song',
+    audioStoragePath: unverifiedPath,
+    audioStorageCleanupStatus: 'active',
+  });
+  await envApi.dbController.adapter.setDoc('songs', 'song_conflict_org', {
+    id: 'song_conflict_org',
+    organizationId: 'org_a',
+    ownerId: 'uid_prom_a',
+    assignedUserIds: ['uid_prom_a'],
+    title: 'Conflict Org Song',
+    audioStoragePath: conflictPath,
+    audioStorageCleanupStatus: 'active',
+  });
+  await envApi.dbController.adapter.setDoc('songs', 'song_already_missing', {
+    id: 'song_already_missing',
+    organizationId: 'org_a',
+    ownerId: 'uid_prom_a',
+    assignedUserIds: ['uid_prom_a'],
+    title: 'Already Missing Object Song',
+    audioStoragePath: alreadyGonePath,
+    audioStorageCleanupStatus: 'active',
+  });
+
+  await withLiveServer(envApi.app, async (baseUrl) => {
+    // Metadata timeout MUST block deletion, preserve song + Storage, and enqueue durable retry!
+    const errRes = await fetch(`${baseUrl}/api/songs/song_meta_err`, {
+      method: 'DELETE',
+      headers: { Authorization: 'Bearer token-promoter-a' },
+    });
+    assert.equal(errRes.status, 502);
+    const errBody = (await errRes.json()) as {
+      ok: boolean;
+      deleted: boolean;
+      cleanupPending: boolean;
+      cleanupQueued: boolean;
+      storageDeleted: boolean;
+    };
+    assert.equal(errBody.ok, false);
+    assert.equal(errBody.deleted, false);
+    assert.equal(errBody.cleanupPending, true);
+    assert.equal(errBody.cleanupQueued, true);
+    assert.equal(errBody.storageDeleted, false);
+    assert.equal(storageApi.objects.has(errPath), true);
+    assert.ok(envApi.dbController.docs.songs.song_meta_err);
+    assert.equal(envApi.dbController.docs.songs.song_meta_err.audioStorageCleanupStatus, 'cleanup_failed');
+    assert.equal(Object.keys(envApi.dbController.docs.audio_cleanup_queue || {}).length, 1);
+
+    // Phase 2 retry while metadata error persists STILL blocks deletion and increments retryCount
+    const phase2Err = await envApi.retentionService.cleanupExpiredAudio({ includeOrphans: false });
+    assert.equal(phase2Err.queueFailed, 1);
+    assert.equal(storageApi.objects.has(errPath), true);
+    assert.ok(envApi.dbController.docs.songs.song_meta_err);
+    const qAfterErr = Object.values(envApi.dbController.docs.audio_cleanup_queue || {});
+    assert.equal(qAfterErr.length, 1);
+    assert.equal(qAfterErr[0].retryCount, 1);
+    assert.equal(qAfterErr[0].storageDeleted, false);
+
+    // Metadata lookup recovers -> Phase 2 retry deletes Storage + song doc + queue item cleanly!
+    storageApi.failMetadataFor(errPath, null);
+    const phase2Recovered = await envApi.retentionService.cleanupExpiredAudio({ includeOrphans: false });
+    assert.equal(phase2Recovered.queueDeleted, 1);
+    assert.equal(storageApi.objects.has(errPath), false);
+    assert.equal(envApi.dbController.docs.songs.song_meta_err, undefined);
+    assert.equal(Object.keys(envApi.dbController.docs.audio_cleanup_queue || {}).length, 0);
+
+    // Missing organizationId metadata -> blocked 403 (never delete unverified ownership)
+    const unverifiedRes = await fetch(`${baseUrl}/api/songs/song_unverified_org`, {
+      method: 'DELETE',
+      headers: { Authorization: 'Bearer token-promoter-a' },
+    });
+    assert.equal(unverifiedRes.status, 403);
+    assert.equal(storageApi.objects.has(unverifiedPath), true);
+    assert.ok(envApi.dbController.docs.songs.song_unverified_org);
+
+    // Cross-org conflict -> blocked 403
+    const conflictRes = await fetch(`${baseUrl}/api/songs/song_conflict_org`, {
+      method: 'DELETE',
+      headers: { Authorization: 'Bearer token-promoter-a' },
+    });
+    assert.equal(conflictRes.status, 403);
+    assert.equal(storageApi.objects.has(conflictPath), true);
+    assert.ok(envApi.dbController.docs.songs.song_conflict_org);
+
+    // Confirmed missing Storage object -> safely completes 200 without endless retries!
+    const missingRes = await fetch(`${baseUrl}/api/songs/song_already_missing`, {
+      method: 'DELETE',
+      headers: { Authorization: 'Bearer token-promoter-a' },
+    });
+    assert.equal(missingRes.status, 200);
+    assert.equal(envApi.dbController.docs.songs.song_already_missing, undefined);
+    assert.equal(Object.keys(envApi.dbController.docs.audio_cleanup_queue || {}).length, 0);
+  });
+
+  // 10b. Phase 1 retention cleanup & Phase 3 orphan reconciliation fail-closed on metadata error, unverified org, and confirmed 404
+  const storagePhases = createInMemoryAudioStorage();
+  const p1ErrPath = 'organizations/org_a/audio/p1-err.mp3';
+  const p1GonePath = 'organizations/org_a/audio/p1-gone.mp3';
+  const p3ErrPath = 'organizations/org_a/audio/p3-err.mp3';
+  const p3UnverifiedPath = 'organizations/org_a/audio/p3-unverified.mp3';
+  const p3ConflictPath = 'organizations/org_a/audio/p3-conflict.mp3';
+
+  storagePhases.seedObject(p1ErrPath, { organizationId: 'org_a', uploadedAt: oldIso });
+  storagePhases.seedObject(p3ErrPath, { organizationId: 'org_a', uploadedAt: oldIso });
+  storagePhases.seedObject(p3UnverifiedPath, { organizationId: '', uploadedAt: oldIso });
+  storagePhases.seedObject(p3ConflictPath, { organizationId: 'org_b', uploadedAt: oldIso });
+
+  storagePhases.failMetadataFor(p1ErrPath, new Error('PERMISSION_DENIED: metadata access denied'));
+  storagePhases.failMetadataFor(p3ErrPath, new Error('ECONNRESET: network failure'));
+
+  const envPhases = buildTestEnvironment({ audioStorage: storagePhases });
+  await envPhases.dbController.adapter.setDoc('songs', 'song_p1_err', {
+    id: 'song_p1_err',
+    organizationId: 'org_a',
+    ownerId: 'uid_prom_a',
+    assignedUserIds: ['uid_prom_a'],
+    title: 'Phase 1 Metadata Error',
+    audioStoragePath: p1ErrPath,
+    audioRetentionExpiresAt: '2026-01-01T00:00:00.000Z',
+    audioStorageCleanupStatus: 'active',
+  });
+  await envPhases.dbController.adapter.setDoc('songs', 'song_p1_gone', {
+    id: 'song_p1_gone',
+    organizationId: 'org_a',
+    ownerId: 'uid_prom_a',
+    assignedUserIds: ['uid_prom_a'],
+    title: 'Phase 1 Confirmed Missing',
+    audioStoragePath: p1GonePath,
+    audioRetentionExpiresAt: '2026-01-01T00:00:00.000Z',
+    audioStorageCleanupStatus: 'active',
+  });
+
+  // Also seed a confirmed-missing Storage item in Phase 2 queue -> should complete cleanly without endless retries!
+  await envPhases.retentionService.enqueueCleanupTask({
+    storageObjectPath: 'organizations/org_a/audio/p2-gone.mp3',
+    organizationId: 'org_a',
+    deleteSongOnCleanup: false,
+    reason: 'gemini_analysis_failed',
+  });
+
+  const phaseRun1 = await envPhases.retentionService.cleanupExpiredAudio({
+    now: runNow,
+    includeOrphans: true,
+    orphanGraceMinutes: 60,
+    organizationId: 'org_a',
+  });
+  // p1ErrPath failed metadata lookup (preserved!), p1GonePath completed as already missing,
+  // p2-gone completed as already missing, p3ErrPath failed metadata lookup (preserved!),
+  // p3UnverifiedPath & p3ConflictPath skipped (never deleted!)
+  assert.equal(storagePhases.objects.has(p1ErrPath), true);
+  assert.equal(storagePhases.objects.has(p3ErrPath), true);
+  assert.equal(storagePhases.objects.has(p3UnverifiedPath), true);
+  assert.equal(storagePhases.objects.has(p3ConflictPath), true);
+  assert.equal(envPhases.dbController.docs.songs.song_p1_gone.audioStorageCleanupStatus, 'deleted');
+  assert.equal(envPhases.dbController.docs.songs.song_p1_err.audioStorageCleanupStatus, 'cleanup_failed');
+  assert.equal(phaseRun1.failed, 2); // p1ErrPath + p3ErrPath
+  assert.equal(phaseRun1.orphansDeleted, 0);
+
+  // Recover metadata lookups -> p1ErrPath and p3ErrPath complete cleanly on retry, while unverified & conflict remain untouched!
+  storagePhases.failMetadataFor(p1ErrPath, null);
+  storagePhases.failMetadataFor(p3ErrPath, null);
+  const phaseRun2 = await envPhases.retentionService.cleanupExpiredAudio({
+    now: runNow,
+    includeOrphans: true,
+    orphanGraceMinutes: 60,
+    organizationId: 'org_a',
+  });
+  assert.equal(phaseRun2.failed, 0);
+  assert.equal(storagePhases.objects.has(p1ErrPath), false);
+  assert.equal(storagePhases.objects.has(p3ErrPath), false);
+  assert.equal(envPhases.dbController.docs.songs.song_p1_err.audioStorageCleanupStatus, 'deleted');
+  assert.equal(Object.keys(envPhases.dbController.docs.audio_cleanup_queue || {}).length, 0);
+  assert.equal(storagePhases.objects.has(p3UnverifiedPath), true);
+  assert.equal(storagePhases.objects.has(p3ConflictPath), true);
+
+  // 10c. Mandatory cursor persistence: Firestore cursor write failures during BOTH progress updates and cycle completion
+  const storageCursor = createInMemoryAudioStorage();
+  const envCursor = buildTestEnvironment({ audioStorage: storageCursor });
+  // Seed 6 objects in org_a: first 2 on each 2-item page are active songs (never deleted!), 0..5 mixed
+  for (let i = 0; i < 6; i++) {
+    const p = `organizations/org_a/audio/cur-${String(i).padStart(2, '0')}.mp3`;
+    storageCursor.seedObject(p, { organizationId: 'org_a', uploadedAt: oldIso });
+    if (i % 2 === 0) {
+      await envCursor.dbController.adapter.setDoc('songs', `song_cur_${i}`, {
+        id: `song_cur_${i}`,
+        organizationId: 'org_a',
+        ownerId: 'uid_prom_a',
+        assignedUserIds: ['uid_prom_a'],
+        title: `Active Cursor Song ${i}`,
+        audioStoragePath: p,
+        audioStorageCleanupStatus: 'active',
+        audioRetentionExpiresAt: '2027-01-01T00:00:00.000Z',
+      });
+    }
+  }
+
+  const cursorDocId = `orphan_cursor_org_${crypto.createHash('sha256').update('org_a').digest('hex').slice(0, 24)}`;
+
+  // Run 1 succeeds on Page 1 (items 0,1) -> cursor points after cur-01
+  const curRun1 = await envCursor.retentionService.cleanupExpiredAudio({
+    now: runNow,
+    includeOrphans: true,
+    orphanGraceMinutes: 60,
+    orphanPageSize: 2,
+    orphanMaxPagesPerRun: 1,
+    organizationId: 'org_a',
+  });
+  assert.equal(curRun1.orphanHasMore, true);
+  assert.equal(curRun1.orphansDeleted, 1); // cur-01 deleted, cur-00 active kept
+  const savedTokenAfterRun1 = String(
+    envCursor.dbController.docs.audio_cleanup_cursors[cursorDocId].nextPageToken
+  );
+  assert.ok(savedTokenAfterRun1.length > 0);
+
+  // Run 2 (progress update) FAILS on writing audio_cleanup_cursors -> endpoint MUST return 500 & preserve Run 1's valid cursor!
+  envCursor.dbController.failSetCounts.set(`audio_cleanup_cursors/${cursorDocId}`, 1);
+  await withLiveServer(envCursor.app, async (baseUrl) => {
+    const failProgressRes = await fetch(`${baseUrl}/api/admin/audio/cleanup`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer token-admin',
+      },
+      body: JSON.stringify({
+        includeOrphans: true,
+        orphanGraceMinutes: 60,
+        orphanPageSize: 2,
+        orphanMaxPagesPerRun: 1,
+        organizationId: 'org_a',
+      }),
+    });
+    assert.equal(failProgressRes.status, 500);
+    const failProgressBody = (await failProgressRes.json()) as { error: string };
+    assert.match(failProgressBody.error, /CURSOR_PERSIST_FAILED/);
+  });
+
+  // Previous valid cursor from Run 1 MUST still be preserved!
+  assert.equal(
+    envCursor.dbController.docs.audio_cleanup_cursors[cursorDocId].nextPageToken,
+    savedTokenAfterRun1
+  );
+
+  // Retry Run 2 -> resumes safely from savedTokenAfterRun1, skips active cur-02, persists token after cur-03!
+  const curRun2Retry = await envCursor.retentionService.cleanupExpiredAudio({
+    now: runNow,
+    includeOrphans: true,
+    orphanGraceMinutes: 60,
+    orphanPageSize: 2,
+    orphanMaxPagesPerRun: 1,
+    organizationId: 'org_a',
+  });
+  assert.equal(curRun2Retry.orphanHasMore, true);
+  assert.equal(storageCursor.objects.has('organizations/org_a/audio/cur-02.mp3'), true);
+  assert.equal(storageCursor.objects.has('organizations/org_a/audio/cur-03.mp3'), false);
+  const savedTokenAfterRun2 = String(
+    envCursor.dbController.docs.audio_cleanup_cursors[cursorDocId].nextPageToken
+  );
+  assert.notEqual(savedTokenAfterRun2, savedTokenAfterRun1);
+
+  // Run 3 (cycle completion) FAILS on writing completion cursor -> MUST reject & MUST NOT reset cursor!
+  envCursor.dbController.failSetCounts.set(`audio_cleanup_cursors/${cursorDocId}`, 1);
+  await assert.rejects(
+    () =>
+      envCursor.retentionService.cleanupExpiredAudio({
+        now: runNow,
+        includeOrphans: true,
+        orphanGraceMinutes: 60,
+        orphanPageSize: 2,
+        orphanMaxPagesPerRun: 1,
+        organizationId: 'org_a',
+      }),
+    /CURSOR_COMPLETION_PERSIST_FAILED/
+  );
+  // Previous valid cursor MUST NOT have been reset!
+  assert.equal(
+    envCursor.dbController.docs.audio_cleanup_cursors[cursorDocId].nextPageToken,
+    savedTokenAfterRun2
+  );
+
+  // Retry Run 3 -> resumes safely from savedTokenAfterRun2, preserves active cur-04, persists completion & ONLY THEN resets cursor!
+  const curRun3Retry = await envCursor.retentionService.cleanupExpiredAudio({
+    now: runNow,
+    includeOrphans: true,
+    orphanGraceMinutes: 60,
+    orphanPageSize: 2,
+    orphanMaxPagesPerRun: 1,
+    organizationId: 'org_a',
+  });
+  assert.equal(curRun3Retry.orphanHasMore, false);
+  assert.equal(envCursor.dbController.docs.audio_cleanup_cursors[cursorDocId].nextPageToken, '');
+  assert.ok(envCursor.dbController.docs.audio_cleanup_cursors[cursorDocId].cycleCompletedAt);
+  assert.equal(storageCursor.objects.has('organizations/org_a/audio/cur-00.mp3'), true);
+  assert.equal(storageCursor.objects.has('organizations/org_a/audio/cur-02.mp3'), true);
+  assert.equal(storageCursor.objects.has('organizations/org_a/audio/cur-04.mp3'), true);
+  assert.equal(storageCursor.objects.has('organizations/org_a/audio/cur-05.mp3'), false);
+
+  // 10d. Repeated pageToken protection prevents infinite pagination loops
+  const loopStorage = createInMemoryAudioStorage();
+  loopStorage.seedObject('organizations/org_a/audio/loop-1.mp3', {
+    organizationId: 'org_a',
+    uploadedAt: oldIso,
+  });
+  let pageCalls = 0;
+  loopStorage.adapter.listAudioObjectsPage = async () => {
+    pageCalls += 1;
+    return {
+      objects: [
+        {
+          path: 'organizations/org_a/audio/loop-1.mp3',
+          organizationId: 'org_a',
+          uploadedAt: oldIso,
+        },
+      ],
+      nextPageToken: 'REPEATED_TOKEN_FOREVER',
+    };
+  };
+  const envLoop = buildTestEnvironment({ audioStorage: loopStorage });
+  const loopRes = await envLoop.retentionService.cleanupExpiredAudio({
+    now: runNow,
+    includeOrphans: true,
+    orphanGraceMinutes: 60,
+    orphanMaxPagesPerRun: 10,
+    organizationId: 'org_a',
+  });
+  assert.equal(pageCalls, 2); // Stopped immediately once REPEATED_TOKEN_FOREVER repeated!
+  assert.equal(loopRes.orphanHasMore, false);
+});
+
 
 

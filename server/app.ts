@@ -35,6 +35,7 @@ import {
   createFirebaseAdminAudioStorage,
   makeCleanupQueueDocId,
   parseAudioOrgFromPath,
+  verifyStorageMetadataOrg,
   type AudioStorageAdapter,
 } from './audioStorage.ts';
 import {
@@ -582,10 +583,11 @@ export function createSonicPushApp(deps: SonicPushAppDeps = {}): Express {
       });
       res.json(summary);
     } catch (err) {
+      const safeErr = sanitizeErrorMessage(err, 'Audio retention cleanup execution failed.');
       logStructured('error', 'audio_cleanup_endpoint_failed', {
-        error: sanitizeErrorMessage(err),
+        error: safeErr,
       });
-      res.status(500).json({ error: 'Audio retention cleanup execution failed.' });
+      res.status(500).json({ error: safeErr });
     }
   });
 
@@ -1067,35 +1069,34 @@ CRITICAL HONESTY & GROUNDING RULES:
             return;
           }
 
-          if (audioStorage.getAudioMetadata) {
-            const objMeta = await audioStorage.getAudioMetadata(storagePath).catch(() => null);
-            if (objMeta?.organizationId && objMeta.organizationId !== songOrg) {
-              logStructured('warn', 'song_delete_cross_org_metadata_blocked', {
-                songId,
-                songOrg,
-                metadataOrg: objMeta.organizationId,
-              });
-              res.status(403).json({
-                ok: false,
-                deleted: false,
-                error: 'Cross-organization storage deletion blocked due to object metadata mismatch.',
-              });
-              return;
-            }
+          const metaCheck = await verifyStorageMetadataOrg(audioStorage, storagePath, songOrg);
+          if (metaCheck.status === 'conflict' || metaCheck.status === 'unverified_org') {
+            logStructured('warn', 'song_delete_cross_org_metadata_blocked', {
+              songId,
+              songOrg,
+              status: metaCheck.status,
+              metadataOrg: metaCheck.status === 'conflict' ? metaCheck.metadataOrg : 'missing',
+            });
+            res.status(403).json({
+              ok: false,
+              deleted: false,
+              error:
+                metaCheck.status === 'conflict'
+                  ? 'Cross-organization storage deletion blocked due to object metadata mismatch.'
+                  : 'Storage deletion blocked because object organization ownership metadata could not be established.',
+            });
+            return;
           }
 
-          try {
-            await audioStorage.deleteAudioObject(storagePath);
-            storageDeleted = true;
-          } catch (storageErr) {
-            const safeErr = sanitizeErrorMessage(
-              storageErr,
-              'Failed to delete private audio file from Storage.'
+          if (metaCheck.status === 'lookup_error') {
+            const safeMetaErr = sanitizeErrorMessage(
+              metaCheck.error,
+              'Failed to verify private audio metadata before deletion.'
             );
             await adminDb
               .updateDoc('songs', songId, {
                 audioStorageCleanupStatus: 'cleanup_failed',
-                audioCleanupError: safeErr.slice(0, 380),
+                audioCleanupError: safeMetaErr.slice(0, 380),
                 updatedAt: SERVER_TIMESTAMP_SENTINEL,
               })
               .catch(() => null);
@@ -1109,18 +1110,18 @@ CRITICAL HONESTY & GROUNDING RULES:
                 deleteSongOnCleanup: true,
                 storageDeleted: false,
                 reason: 'song_delete_failed',
-                error: storageErr,
+                error: metaCheck.error,
               });
               cleanupQueued = true;
             } catch {
               cleanupQueued = false;
             }
 
-            logStructured('error', 'song_delete_storage_failed_preserved_db', {
+            logStructured('error', 'song_delete_metadata_lookup_failed_preserved_db', {
               songId,
               orgId: songOrg,
               cleanupQueued,
-              error: safeErr,
+              error: safeMetaErr,
             });
 
             res.status(502).json({
@@ -1131,9 +1132,66 @@ CRITICAL HONESTY & GROUNDING RULES:
               storageDeleted: false,
               songId,
               error:
-                'Private audio deletion failed in Storage. Database metadata was preserved and cleanup retry has been queued.',
+                'Private audio metadata verification failed. Storage object and database record were preserved and cleanup retry has been queued.',
             });
             return;
+          }
+
+          if (metaCheck.status === 'missing_object') {
+            // Confirmed 404 / missing Storage object: handle safely as already deleted
+            storageDeleted = true;
+          } else {
+            try {
+              await audioStorage.deleteAudioObject(storagePath);
+              storageDeleted = true;
+            } catch (storageErr) {
+              const safeErr = sanitizeErrorMessage(
+                storageErr,
+                'Failed to delete private audio file from Storage.'
+              );
+              await adminDb
+                .updateDoc('songs', songId, {
+                  audioStorageCleanupStatus: 'cleanup_failed',
+                  audioCleanupError: safeErr.slice(0, 380),
+                  updatedAt: SERVER_TIMESTAMP_SENTINEL,
+                })
+                .catch(() => null);
+
+              let cleanupQueued = false;
+              try {
+                await audioRetention.enqueueCleanupTask({
+                  storageObjectPath: storagePath,
+                  organizationId: songOrg,
+                  songId,
+                  deleteSongOnCleanup: true,
+                  storageDeleted: false,
+                  reason: 'song_delete_failed',
+                  error: storageErr,
+                });
+                cleanupQueued = true;
+              } catch {
+                cleanupQueued = false;
+              }
+
+              logStructured('error', 'song_delete_storage_failed_preserved_db', {
+                songId,
+                orgId: songOrg,
+                cleanupQueued,
+                error: safeErr,
+              });
+
+              res.status(502).json({
+                ok: false,
+                deleted: false,
+                cleanupPending: true,
+                cleanupQueued,
+                storageDeleted: false,
+                songId,
+                error:
+                  'Private audio deletion failed in Storage. Database metadata was preserved and cleanup retry has been queued.',
+              });
+              return;
+            }
           }
         }
 
