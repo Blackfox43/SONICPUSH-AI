@@ -1,0 +1,686 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global Default-Deny Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Startup connectivity check
+    match /test/{docId} {
+      allow get: if docId == 'connection';
+    }
+
+    // -------------------------------------------------------------------------
+    // Core Primitives & Identity Helpers
+    // -------------------------------------------------------------------------
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isBootstrappedAdmin() {
+      return isVerified() && request.auth.token.email == 'emma432cent@gmail.com';
+    }
+
+    function isSuperAdmin() {
+      return isBootstrappedAdmin() || (
+        isVerified() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'SUPER_ADMIN'
+      );
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidCurrency(c) {
+      return c is string && c in ['NGN', 'USD', 'GBP', 'EUR'];
+    }
+
+    function isValidAssignedUsers(arr) {
+      return arr is list && arr.size() >= 1 && arr.size() <= 25 && arr[0] is string && request.auth.uid in arr;
+    }
+
+    function isOwnerOrAssignedExisting() {
+      return isVerified() && (
+        existing().ownerId == request.auth.uid ||
+        (existing().assignedUserIds is list && request.auth.uid in existing().assignedUserIds) ||
+        isSuperAdmin()
+      );
+    }
+
+    function canListScopedDoc() {
+      return isVerified() && (
+        isBootstrappedAdmin() ||
+        existing().ownerId == request.auth.uid ||
+        (existing().assignedUserIds is list && request.auth.uid in existing().assignedUserIds)
+      );
+    }
+
+    function hasImmutableScopeFields() {
+      return incoming().id == existing().id &&
+             incoming().organizationId == existing().organizationId &&
+             incoming().ownerId == existing().ownerId &&
+             incoming().createdAt == existing().createdAt &&
+             incoming().updatedAt == request.time;
+    }
+
+    function hasValidCreateScope(docId) {
+      return isValidId(docId) &&
+             incoming().id == docId &&
+             isValidId(incoming().organizationId) &&
+             incoming().ownerId == request.auth.uid &&
+             isValidAssignedUsers(incoming().assignedUserIds) &&
+             incoming().createdAt == request.time &&
+             incoming().updatedAt == request.time;
+    }
+
+    // -------------------------------------------------------------------------
+    // Entity Validation Blueprints
+    // -------------------------------------------------------------------------
+    function isValidUser(data) {
+      return data.keys().hasAll(['uid', 'ownerId', 'email', 'displayName', 'role', 'organizationId', 'preferredCurrency', 'onboardingCompleted', 'createdAt', 'updatedAt']) &&
+             data.keys().hasOnly(['uid', 'ownerId', 'email', 'displayName', 'photoURL', 'role', 'organizationId', 'preferredCurrency', 'onboardingCompleted', 'createdAt', 'updatedAt']) &&
+             isValidId(data.uid) &&
+             isValidId(data.ownerId) &&
+             data.email is string && data.email.size() >= 3 && data.email.size() <= 254 &&
+             data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 120 &&
+             (!('photoURL' in data) || (data.photoURL is string && data.photoURL.size() <= 1024)) &&
+             data.role in ['SUPER_ADMIN', 'PROMOTER', 'ARTIST'] &&
+             isValidId(data.organizationId) &&
+             isValidCurrency(data.preferredCurrency) &&
+             data.onboardingCompleted is bool &&
+             data.createdAt is timestamp &&
+             data.updatedAt is timestamp;
+    }
+
+    function isValidOrganization(data) {
+      return data.keys().hasAll(['id', 'ownerId', 'name', 'type', 'country', 'defaultCurrency', 'assignedUserIds', 'createdAt', 'updatedAt']) &&
+             data.keys().hasOnly(['id', 'ownerId', 'name', 'type', 'country', 'defaultCurrency', 'assignedUserIds', 'createdAt', 'updatedAt']) &&
+             isValidId(data.id) &&
+             isValidId(data.ownerId) &&
+             data.name is string && data.name.size() >= 1 && data.name.size() <= 160 &&
+             data.type in ['AGENCY', 'INDEPENDENT_ARTIST', 'LABEL'] &&
+             data.country is string && data.country.size() >= 1 && data.country.size() <= 80 &&
+             isValidCurrency(data.defaultCurrency) &&
+             data.assignedUserIds is list && data.assignedUserIds.size() >= 1 && data.assignedUserIds.size() <= 25 && data.assignedUserIds[0] is string &&
+             data.createdAt is timestamp &&
+             data.updatedAt is timestamp;
+    }
+
+    function isValidArtist(data) {
+      return data.keys().hasAll(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'name', 'bio', 'country', 'city', 'genre', 'languages', 'targetAudience', 'careerStage', 'marketingObjectives', 'archived', 'createdAt', 'updatedAt']) &&
+             data.keys().hasOnly(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'name', 'avatarUrl', 'bio', 'country', 'city', 'genre', 'languages', 'targetAudience', 'socialLinks', 'streamingLinks', 'labelOrManagement', 'careerStage', 'marketingObjectives', 'archived', 'createdAt', 'updatedAt']) &&
+             data.name is string && data.name.size() >= 1 && data.name.size() <= 140 &&
+             (!('avatarUrl' in data) || (data.avatarUrl is string && data.avatarUrl.size() <= 1024)) &&
+             data.bio is string && data.bio.size() <= 3000 &&
+             data.country is string && data.country.size() <= 80 &&
+             data.city is string && data.city.size() <= 80 &&
+             data.genre is string && data.genre.size() <= 120 &&
+             data.languages is string && data.languages.size() <= 200 &&
+             data.targetAudience is string && data.targetAudience.size() <= 600 &&
+             (!('socialLinks' in data) || data.socialLinks is map) &&
+             (!('streamingLinks' in data) || data.streamingLinks is map) &&
+             (!('labelOrManagement' in data) || (data.labelOrManagement is string && data.labelOrManagement.size() <= 160)) &&
+             data.careerStage in ['Emerging', 'Developing', 'Breakout', 'Established', 'International'] &&
+             data.marketingObjectives is string && data.marketingObjectives.size() <= 1200 &&
+             data.archived is bool &&
+             data.createdAt is timestamp &&
+             data.updatedAt is timestamp;
+    }
+
+    function isValidSong(data) {
+      return data.keys().hasAll(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'artistId', 'artistName', 'title', 'genre', 'language', 'releaseDate', 'audioProcessed', 'message', 'moodAndStyle', 'createdAt', 'updatedAt']) &&
+             data.keys().hasOnly(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'artistId', 'artistName', 'title', 'genre', 'language', 'releaseDate', 'streamingLink', 'audioFileName', 'audioStorageUrl', 'audioProcessed', 'message', 'moodAndStyle', 'lyrics', 'intelligence', 'createdAt', 'updatedAt']) &&
+             isValidId(data.artistId) &&
+             data.artistName is string && data.artistName.size() <= 140 &&
+             data.title is string && data.title.size() >= 1 && data.title.size() <= 180 &&
+             data.genre is string && data.genre.size() <= 120 &&
+             data.language is string && data.language.size() <= 100 &&
+             data.releaseDate is string && data.releaseDate.size() <= 40 &&
+             (!('streamingLink' in data) || (data.streamingLink is string && data.streamingLink.size() <= 1024)) &&
+             (!('audioFileName' in data) || (data.audioFileName is string && data.audioFileName.size() <= 240)) &&
+             (!('audioStorageUrl' in data) || (data.audioStorageUrl is string && data.audioStorageUrl.size() <= 1024)) &&
+             data.audioProcessed is bool &&
+             data.message is string && data.message.size() <= 1500 &&
+             data.moodAndStyle is string && data.moodAndStyle.size() <= 800 &&
+             (!('lyrics' in data) || (data.lyrics is string && data.lyrics.size() <= 8000)) &&
+             (!('intelligence' in data) || data.intelligence is map) &&
+             data.createdAt is timestamp &&
+             data.updatedAt is timestamp;
+    }
+
+    function isValidCampaign(data) {
+      return data.keys().hasAll(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'artistId', 'artistName', 'name', 'campaignType', 'durationDays', 'currency', 'budget', 'status', 'strategySections', 'createdAt', 'updatedAt']) &&
+             data.keys().hasOnly(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'artistId', 'artistName', 'songId', 'songTitle', 'name', 'campaignType', 'durationDays', 'startDate', 'endDate', 'currency', 'budget', 'status', 'targetMarkets', 'strategySections', 'createdAt', 'updatedAt']) &&
+             isValidId(data.artistId) &&
+             data.artistName is string && data.artistName.size() <= 140 &&
+             (!('songId' in data) || (data.songId is string && data.songId.size() <= 128)) &&
+             (!('songTitle' in data) || (data.songTitle is string && data.songTitle.size() <= 180)) &&
+             data.name is string && data.name.size() >= 1 && data.name.size() <= 200 &&
+             data.campaignType is string && data.campaignType.size() <= 100 &&
+             data.durationDays is number && data.durationDays >= 1 && data.durationDays <= 365 &&
+             (!('startDate' in data) || (data.startDate is string && data.startDate.size() <= 40)) &&
+             (!('endDate' in data) || (data.endDate is string && data.endDate.size() <= 40)) &&
+             isValidCurrency(data.currency) &&
+             data.budget is number && data.budget >= 0 &&
+             data.status in ['draft', 'active', 'paused', 'completed', 'archived'] &&
+             (!('targetMarkets' in data) || (data.targetMarkets is string && data.targetMarkets.size() <= 300)) &&
+             data.strategySections is map &&
+             data.createdAt is timestamp &&
+             data.updatedAt is timestamp;
+    }
+
+    function isValidCampaignTask(data) {
+      return data.keys().hasAll(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'title', 'department', 'dueDate', 'priority', 'status', 'createdAt', 'updatedAt']) &&
+             data.keys().hasOnly(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'campaignId', 'campaignName', 'title', 'department', 'dueDate', 'priority', 'status', 'notes', 'createdAt', 'updatedAt']) &&
+             (!('campaignId' in data) || (data.campaignId is string && data.campaignId.size() <= 128)) &&
+             (!('campaignName' in data) || (data.campaignName is string && data.campaignName.size() <= 200)) &&
+             data.title is string && data.title.size() >= 1 && data.title.size() <= 220 &&
+             data.department is string && data.department.size() <= 80 &&
+             data.dueDate is string && data.dueDate.size() <= 40 &&
+             data.priority in ['low', 'medium', 'high'] &&
+             data.status in ['todo', 'in_progress', 'done'] &&
+             (!('notes' in data) || (data.notes is string && data.notes.size() <= 1200)) &&
+             data.createdAt is timestamp &&
+             data.updatedAt is timestamp;
+    }
+
+    function isValidContentIdea(data) {
+      return data.keys().hasAll(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'category', 'durationSeconds', 'title', 'openingHook', 'sceneInstructions', 'caption', 'callToAction', 'isFavorite', 'createdAt', 'updatedAt']) &&
+             data.keys().hasOnly(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'artistId', 'songId', 'category', 'durationSeconds', 'title', 'openingHook', 'sceneInstructions', 'onScreenText', 'audioPlacement', 'caption', 'callToAction', 'hashtags', 'isFavorite', 'createdAt', 'updatedAt']) &&
+             (!('artistId' in data) || (data.artistId is string && data.artistId.size() <= 128)) &&
+             (!('songId' in data) || (data.songId is string && data.songId.size() <= 128)) &&
+             data.category is string && data.category.size() <= 100 &&
+             data.durationSeconds is number && data.durationSeconds in [15, 30, 60] &&
+             data.title is string && data.title.size() >= 1 && data.title.size() <= 200 &&
+             data.openingHook is string && data.openingHook.size() <= 400 &&
+             data.sceneInstructions is string && data.sceneInstructions.size() <= 2000 &&
+             (!('onScreenText' in data) || (data.onScreenText is string && data.onScreenText.size() <= 500)) &&
+             (!('audioPlacement' in data) || (data.audioPlacement is string && data.audioPlacement.size() <= 400)) &&
+             data.caption is string && data.caption.size() <= 1000 &&
+             data.callToAction is string && data.callToAction.size() <= 300 &&
+             (!('hashtags' in data) || (data.hashtags is string && data.hashtags.size() <= 400)) &&
+             data.isFavorite is bool &&
+             data.createdAt is timestamp &&
+             data.updatedAt is timestamp;
+    }
+
+    function isValidContentCalendarItem(data) {
+      return data.keys().hasAll(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'title', 'platform', 'scheduledDate', 'status', 'createdAt', 'updatedAt']) &&
+             data.keys().hasOnly(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'campaignId', 'title', 'platform', 'scheduledDate', 'format', 'status', 'notes', 'createdAt', 'updatedAt']) &&
+             (!('campaignId' in data) || (data.campaignId is string && data.campaignId.size() <= 128)) &&
+             data.title is string && data.title.size() >= 1 && data.title.size() <= 200 &&
+             data.platform is string && data.platform.size() <= 80 &&
+             data.scheduledDate is string && data.scheduledDate.size() <= 40 &&
+             (!('format' in data) || (data.format is string && data.format.size() <= 80)) &&
+             data.status in ['planned', 'in_production', 'ready', 'published'] &&
+             (!('notes' in data) || (data.notes is string && data.notes.size() <= 1000)) &&
+             data.createdAt is timestamp &&
+             data.updatedAt is timestamp;
+    }
+
+    function isValidInfluencerContact(data) {
+      return data.keys().hasAll(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'name', 'platform', 'country', 'genreFit', 'sourceType', 'discussionStatus', 'createdAt', 'updatedAt']) &&
+             data.keys().hasOnly(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'name', 'handle', 'platform', 'country', 'genreFit', 'sourceType', 'publicContact', 'discussionStatus', 'agreedDeliverables', 'campaignResults', 'outreachDraft', 'createdAt', 'updatedAt']) &&
+             data.name is string && data.name.size() >= 1 && data.name.size() <= 160 &&
+             (!('handle' in data) || (data.handle is string && data.handle.size() <= 120)) &&
+             data.platform is string && data.platform.size() <= 80 &&
+             data.country is string && data.country.size() <= 80 &&
+             data.genreFit is string && data.genreFit.size() <= 120 &&
+             data.sourceType in ['researched', 'manual'] &&
+             (!('publicContact' in data) || (data.publicContact is string && data.publicContact.size() <= 240)) &&
+             data.discussionStatus in ['identified', 'contacted', 'negotiating', 'agreed', 'delivered', 'declined'] &&
+             (!('agreedDeliverables' in data) || (data.agreedDeliverables is string && data.agreedDeliverables.size() <= 1000)) &&
+             (!('campaignResults' in data) || (data.campaignResults is string && data.campaignResults.size() <= 1000)) &&
+             (!('outreachDraft' in data) || (data.outreachDraft is string && data.outreachDraft.size() <= 2500)) &&
+             data.createdAt is timestamp &&
+             data.updatedAt is timestamp;
+    }
+
+    function isValidMediaContact(data) {
+      return data.keys().hasAll(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'name', 'category', 'country', 'platform', 'outreachStatus', 'createdAt', 'updatedAt']) &&
+             data.keys().hasOnly(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'name', 'category', 'country', 'location', 'platform', 'publicContact', 'outreachStatus', 'lastContactDate', 'followUpDate', 'notes', 'createdAt', 'updatedAt']) &&
+             data.name is string && data.name.size() >= 1 && data.name.size() <= 160 &&
+             data.category in ['DJs', 'Radio stations', 'Radio presenters', 'Music bloggers', 'Entertainment journalists', 'Music magazines', 'Playlist curators', 'Event organizers', 'Music influencers'] &&
+             data.country is string && data.country.size() <= 80 &&
+             (!('location' in data) || (data.location is string && data.location.size() <= 120)) &&
+             data.platform is string && data.platform.size() <= 100 &&
+             (!('publicContact' in data) || (data.publicContact is string && data.publicContact.size() <= 240)) &&
+             data.outreachStatus in ['not_contacted', 'pitched', 'follow_up_due', 'responded', 'confirmed', 'declined'] &&
+             (!('lastContactDate' in data) || (data.lastContactDate is string && data.lastContactDate.size() <= 40)) &&
+             (!('followUpDate' in data) || (data.followUpDate is string && data.followUpDate.size() <= 40)) &&
+             (!('notes' in data) || (data.notes is string && data.notes.size() <= 1500)) &&
+             data.createdAt is timestamp &&
+             data.updatedAt is timestamp;
+    }
+
+    function isValidPlaylistOpportunity(data) {
+      return data.keys().hasAll(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'playlistName', 'platform', 'playlistType', 'status', 'createdAt', 'updatedAt']) &&
+             data.keys().hasOnly(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'playlistName', 'platform', 'playlistType', 'submissionRequirements', 'submissionLink', 'submissionDate', 'status', 'responseNotes', 'songTitle', 'createdAt', 'updatedAt']) &&
+             data.playlistName is string && data.playlistName.size() >= 1 && data.playlistName.size() <= 180 &&
+             data.platform is string && data.platform.size() <= 80 &&
+             data.playlistType in ['official_editorial', 'independent_curator'] &&
+             (!('submissionRequirements' in data) || (data.submissionRequirements is string && data.submissionRequirements.size() <= 1000)) &&
+             (!('submissionLink' in data) || (data.submissionLink is string && data.submissionLink.size() <= 1024)) &&
+             (!('submissionDate' in data) || (data.submissionDate is string && data.submissionDate.size() <= 40)) &&
+             data.status in ['researched', 'submitted', 'under_review', 'accepted', 'rejected'] &&
+             (!('responseNotes' in data) || (data.responseNotes is string && data.responseNotes.size() <= 1000)) &&
+             (!('songTitle' in data) || (data.songTitle is string && data.songTitle.size() <= 180)) &&
+             data.createdAt is timestamp &&
+             data.updatedAt is timestamp;
+    }
+
+    function isValidOutreachHistory(data) {
+      return data.keys().hasAll(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'contactName', 'channel', 'messageBody', 'userAuthorized', 'createdAt', 'updatedAt']) &&
+             data.keys().hasOnly(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'contactId', 'contactName', 'channel', 'subject', 'messageBody', 'userAuthorized', 'outcome', 'createdAt', 'updatedAt']) &&
+             (!('contactId' in data) || (data.contactId is string && data.contactId.size() <= 128)) &&
+             data.contactName is string && data.contactName.size() >= 1 && data.contactName.size() <= 160 &&
+             data.channel in ['WhatsApp', 'Instagram DM', 'Email'] &&
+             (!('subject' in data) || (data.subject is string && data.subject.size() <= 200)) &&
+             data.messageBody is string && data.messageBody.size() >= 1 && data.messageBody.size() <= 4000 &&
+             data.userAuthorized is bool &&
+             (!('outcome' in data) || (data.outcome is string && data.outcome.size() <= 300)) &&
+             data.createdAt is timestamp &&
+             data.updatedAt is timestamp;
+    }
+
+    function isValidCampaignMetric(data) {
+      return data.keys().hasAll(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'campaignId', 'campaignName', 'platform', 'recordedDate', 'entrySource', 'currency', 'createdAt', 'updatedAt']) &&
+             data.keys().hasOnly(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'campaignId', 'campaignName', 'platform', 'recordedDate', 'entrySource', 'reach', 'impressions', 'videoViews', 'engagement', 'shares', 'comments', 'saves', 'linkClicks', 'reportedStreams', 'followersGained', 'adSpend', 'currency', 'createdAt', 'updatedAt']) &&
+             isValidId(data.campaignId) &&
+             data.campaignName is string && data.campaignName.size() <= 200 &&
+             data.platform is string && data.platform.size() <= 80 &&
+             data.recordedDate is string && data.recordedDate.size() <= 40 &&
+             data.entrySource in ['manual', 'api'] &&
+             isValidCurrency(data.currency) &&
+             (!('reach' in data) || (data.reach is number && data.reach >= 0)) &&
+             (!('impressions' in data) || (data.impressions is number && data.impressions >= 0)) &&
+             (!('videoViews' in data) || (data.videoViews is number && data.videoViews >= 0)) &&
+             (!('engagement' in data) || (data.engagement is number && data.engagement >= 0)) &&
+             (!('shares' in data) || (data.shares is number && data.shares >= 0)) &&
+             (!('comments' in data) || (data.comments is number && data.comments >= 0)) &&
+             (!('saves' in data) || (data.saves is number && data.saves >= 0)) &&
+             (!('linkClicks' in data) || (data.linkClicks is number && data.linkClicks >= 0)) &&
+             (!('reportedStreams' in data) || (data.reportedStreams is number && data.reportedStreams >= 0)) &&
+             (!('followersGained' in data) || (data.followersGained is number && data.followersGained >= 0)) &&
+             (!('adSpend' in data) || (data.adSpend is number && data.adSpend >= 0)) &&
+             data.createdAt is timestamp &&
+             data.updatedAt is timestamp;
+    }
+
+    function isValidClient(data) {
+      return data.keys().hasAll(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'name', 'email', 'country', 'packageTier', 'onboardingStatus', 'paymentStatus', 'createdAt', 'updatedAt']) &&
+             data.keys().hasOnly(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'name', 'email', 'companyOrLabel', 'country', 'packageTier', 'onboardingStatus', 'paymentStatus', 'assignedArtistNames', 'internalNotes', 'communicationHistory', 'createdAt', 'updatedAt']) &&
+             data.name is string && data.name.size() >= 1 && data.name.size() <= 160 &&
+             data.email is string && data.email.size() >= 3 && data.email.size() <= 254 &&
+             (!('companyOrLabel' in data) || (data.companyOrLabel is string && data.companyOrLabel.size() <= 160)) &&
+             data.country is string && data.country.size() <= 80 &&
+             data.packageTier in ['STARTER', 'GROWTH', 'PREMIUM', 'ELITE', 'CUSTOM CAMPAIGN'] &&
+             data.onboardingStatus in ['pending', 'in_progress', 'active', 'completed'] &&
+             data.paymentStatus in ['unpaid', 'pending_verification', 'paid', 'overdue'] &&
+             (!('assignedArtistNames' in data) || (data.assignedArtistNames is string && data.assignedArtistNames.size() <= 400)) &&
+             (!('internalNotes' in data) || (data.internalNotes is string && data.internalNotes.size() <= 2000)) &&
+             (!('communicationHistory' in data) || (data.communicationHistory is string && data.communicationHistory.size() <= 3000)) &&
+             data.createdAt is timestamp &&
+             data.updatedAt is timestamp;
+    }
+
+    function isValidServicePackage(data) {
+      return data.keys().hasAll(['id', 'ownerId', 'tier', 'title', 'description', 'isConfigured', 'isPublic', 'campaignLimit', 'deliverables', 'createdAt', 'updatedAt']) &&
+             data.keys().hasOnly(['id', 'ownerId', 'tier', 'title', 'description', 'priceNGN', 'priceUSD', 'isConfigured', 'isPublic', 'campaignLimit', 'deliverables', 'createdAt', 'updatedAt']) &&
+             isValidId(data.ownerId) &&
+             data.tier in ['STARTER', 'GROWTH', 'PREMIUM', 'ELITE', 'CUSTOM CAMPAIGN'] &&
+             data.title is string && data.title.size() >= 1 && data.title.size() <= 120 &&
+             data.description is string && data.description.size() <= 600 &&
+             (!('priceNGN' in data) || (data.priceNGN is number && data.priceNGN >= 0)) &&
+             (!('priceUSD' in data) || (data.priceUSD is number && data.priceUSD >= 0)) &&
+             data.isConfigured is bool &&
+             data.isPublic is bool &&
+             data.campaignLimit is number && data.campaignLimit >= 1 && data.campaignLimit <= 1000 &&
+             data.deliverables is list && data.deliverables.size() <= 20 && (data.deliverables.size() == 0 || data.deliverables[0] is string) &&
+             data.createdAt is timestamp &&
+             data.updatedAt is timestamp;
+    }
+
+    function isValidInvoice(data) {
+      return data.keys().hasAll(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'clientName', 'billingType', 'currency', 'amount', 'dueDate', 'status', 'createdAt', 'updatedAt']) &&
+             data.keys().hasOnly(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'clientName', 'packageTier', 'billingType', 'currency', 'amount', 'dueDate', 'status', 'notes', 'createdAt', 'updatedAt']) &&
+             data.clientName is string && data.clientName.size() >= 1 && data.clientName.size() <= 160 &&
+             (!('packageTier' in data) || (data.packageTier is string && data.packageTier.size() <= 80)) &&
+             data.billingType in ['one_time_campaign', 'monthly_subscription', 'agency_package', 'custom_project'] &&
+             isValidCurrency(data.currency) &&
+             data.amount is number && data.amount >= 0 &&
+             data.dueDate is string && data.dueDate.size() <= 40 &&
+             data.status in ['draft', 'sent', 'awaiting_verification', 'paid', 'overdue', 'void'] &&
+             (!('notes' in data) || (data.notes is string && data.notes.size() <= 1000)) &&
+             data.createdAt is timestamp &&
+             data.updatedAt is timestamp;
+    }
+
+    function isValidPayment(data) {
+      return data.keys().hasAll(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'invoiceId', 'provider', 'reference', 'currency', 'amount', 'verificationStatus', 'createdAt', 'updatedAt']) &&
+             data.keys().hasOnly(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'invoiceId', 'provider', 'reference', 'currency', 'amount', 'verificationStatus', 'createdAt', 'updatedAt']) &&
+             isValidId(data.invoiceId) &&
+             data.provider in ['paystack', 'flutterwave', 'stripe', 'manual_transfer'] &&
+             data.reference is string && data.reference.size() >= 1 && data.reference.size() <= 160 &&
+             isValidCurrency(data.currency) &&
+             data.amount is number && data.amount >= 0 &&
+             data.verificationStatus in ['pending', 'awaiting_provider_integration', 'verified', 'failed'] &&
+             data.createdAt is timestamp &&
+             data.updatedAt is timestamp;
+    }
+
+    function isValidNotification(data) {
+      return data.keys().hasAll(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'category', 'title', 'message', 'read', 'createdAt', 'updatedAt']) &&
+             data.keys().hasOnly(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'category', 'title', 'message', 'targetDate', 'read', 'createdAt', 'updatedAt']) &&
+             data.category in ['campaign_deadline', 'upcoming_release', 'outreach_followup', 'client_update', 'campaign_completed', 'task_assignment'] &&
+             data.title is string && data.title.size() >= 1 && data.title.size() <= 180 &&
+             data.message is string && data.message.size() <= 600 &&
+             (!('targetDate' in data) || (data.targetDate is string && data.targetDate.size() <= 40)) &&
+             data.read is bool &&
+             data.createdAt is timestamp &&
+             data.updatedAt is timestamp;
+    }
+
+    function isValidAiUsageLog(data) {
+      return data.keys().hasAll(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'feature', 'model', 'status', 'latencyMs', 'createdAt', 'updatedAt']) &&
+             data.keys().hasOnly(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'feature', 'model', 'status', 'latencyMs', 'createdAt', 'updatedAt']) &&
+             data.feature is string && data.feature.size() <= 100 &&
+             data.model is string && data.model.size() <= 80 &&
+             data.status in ['success', 'error'] &&
+             data.latencyMs is number && data.latencyMs >= 0 &&
+             data.createdAt is timestamp &&
+             data.updatedAt is timestamp;
+    }
+
+    function isValidAdPlan(data) {
+      return data.keys().hasAll(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'platform', 'objective', 'currency', 'budget', 'durationDays', 'humanConfirmed', 'apiExecutionState', 'createdAt', 'updatedAt']) &&
+             data.keys().hasOnly(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'campaignId', 'platform', 'objective', 'audienceDefinition', 'geoTargeting', 'currency', 'budget', 'durationDays', 'creativeRecommendations', 'adCopy', 'humanConfirmed', 'apiExecutionState', 'createdAt', 'updatedAt']) &&
+             (!('campaignId' in data) || (data.campaignId is string && data.campaignId.size() <= 128)) &&
+             data.platform in ['Meta Ads', 'Instagram Ads', 'Facebook Ads', 'TikTok Ads', 'YouTube Ads'] &&
+             data.objective is string && data.objective.size() >= 1 && data.objective.size() <= 200 &&
+             (!('audienceDefinition' in data) || (data.audienceDefinition is string && data.audienceDefinition.size() <= 600)) &&
+             (!('geoTargeting' in data) || (data.geoTargeting is string && data.geoTargeting.size() <= 300)) &&
+             isValidCurrency(data.currency) &&
+             data.budget is number && data.budget >= 0 &&
+             data.durationDays is number && data.durationDays >= 1 && data.durationDays <= 365 &&
+             (!('creativeRecommendations' in data) || (data.creativeRecommendations is string && data.creativeRecommendations.size() <= 1500)) &&
+             (!('adCopy' in data) || (data.adCopy is string && data.adCopy.size() <= 1500)) &&
+             data.humanConfirmed is bool &&
+             data.apiExecutionState in ['manual_plan_only', 'awaiting_api_integration'] &&
+             data.createdAt is timestamp &&
+             data.updatedAt is timestamp;
+    }
+
+    // -------------------------------------------------------------------------
+    // Collection Rules
+    // -------------------------------------------------------------------------
+    match /users/{userId} {
+      allow get: if isVerified() && isValidId(userId) && (request.auth.uid == userId || isSuperAdmin());
+      allow list: if isVerified() && (isBootstrappedAdmin() || existing().ownerId == request.auth.uid);
+      allow create: if isVerified() && isValidId(userId) && isValidUser(incoming()) &&
+                       userId == request.auth.uid &&
+                       incoming().uid == request.auth.uid &&
+                       incoming().ownerId == request.auth.uid &&
+                       incoming().createdAt == request.time &&
+                       incoming().updatedAt == request.time &&
+                       (incoming().role in ['ARTIST', 'PROMOTER'] || (isBootstrappedAdmin() && incoming().role == 'SUPER_ADMIN'));
+      allow update: if isVerified() && isValidId(userId) && isValidUser(incoming()) &&
+                       incoming().uid == existing().uid &&
+                       incoming().ownerId == existing().ownerId &&
+                       incoming().createdAt == existing().createdAt &&
+                       incoming().updatedAt == request.time && (
+                         isSuperAdmin() ||
+                         (request.auth.uid == userId &&
+                          incoming().role == existing().role &&
+                          incoming().organizationId == existing().organizationId &&
+                          incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoURL', 'preferredCurrency', 'onboardingCompleted', 'updatedAt']))
+                       );
+      allow delete: if isSuperAdmin() && isValidId(userId);
+    }
+
+    match /organizations/{orgId} {
+      allow get: if isValidId(orgId) && isOwnerOrAssignedExisting();
+      allow list: if canListScopedDoc();
+      allow create: if isVerified() && isValidId(orgId) && isValidOrganization(incoming()) &&
+                       incoming().id == orgId &&
+                       incoming().ownerId == request.auth.uid &&
+                       isValidAssignedUsers(incoming().assignedUserIds) &&
+                       incoming().createdAt == request.time &&
+                       incoming().updatedAt == request.time;
+      allow update: if isVerified() && isValidId(orgId) && isValidOrganization(incoming()) &&
+                       incoming().id == existing().id &&
+                       incoming().ownerId == existing().ownerId &&
+                       incoming().createdAt == existing().createdAt &&
+                       incoming().updatedAt == request.time && (
+                         isSuperAdmin() ||
+                         (existing().ownerId == request.auth.uid &&
+                          incoming().diff(existing()).affectedKeys().hasOnly(['name', 'type', 'country', 'defaultCurrency', 'assignedUserIds', 'updatedAt']))
+                       );
+      allow delete: if isSuperAdmin() && isValidId(orgId);
+    }
+
+    match /artists/{artistId} {
+      allow get: if isValidId(artistId) && isOwnerOrAssignedExisting();
+      allow list: if canListScopedDoc();
+      allow create: if isVerified() && isValidArtist(incoming()) && hasValidCreateScope(artistId);
+      allow update: if isVerified() && isValidId(artistId) && isValidArtist(incoming()) && hasImmutableScopeFields() && (
+        isSuperAdmin() ||
+        (isOwnerOrAssignedExisting() && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'avatarUrl', 'bio', 'country', 'city', 'genre', 'languages', 'targetAudience', 'socialLinks', 'streamingLinks', 'labelOrManagement', 'careerStage', 'marketingObjectives', 'archived', 'assignedUserIds', 'updatedAt']))
+      );
+      allow delete: if isValidId(artistId) && (isSuperAdmin() || (isVerified() && existing().ownerId == request.auth.uid));
+    }
+
+    match /songs/{songId} {
+      allow get: if isValidId(songId) && isOwnerOrAssignedExisting();
+      allow list: if canListScopedDoc();
+      allow create: if isVerified() && isValidSong(incoming()) && hasValidCreateScope(songId) &&
+                       exists(/databases/$(database)/documents/artists/$(incoming().artistId));
+      allow update: if isVerified() && isValidId(songId) && isValidSong(incoming()) && hasImmutableScopeFields() &&
+                       incoming().artistId == existing().artistId && (
+        isSuperAdmin() ||
+        (isOwnerOrAssignedExisting() && incoming().diff(existing()).affectedKeys().hasOnly(['artistName', 'title', 'genre', 'language', 'releaseDate', 'streamingLink', 'audioFileName', 'audioStorageUrl', 'audioProcessed', 'message', 'moodAndStyle', 'lyrics', 'intelligence', 'assignedUserIds', 'updatedAt']))
+      );
+      allow delete: if isValidId(songId) && (isSuperAdmin() || (isVerified() && existing().ownerId == request.auth.uid));
+    }
+
+    match /campaigns/{campaignId} {
+      allow get: if isValidId(campaignId) && isOwnerOrAssignedExisting();
+      allow list: if canListScopedDoc();
+      allow create: if isVerified() && isValidCampaign(incoming()) && hasValidCreateScope(campaignId) &&
+                       exists(/databases/$(database)/documents/artists/$(incoming().artistId));
+      allow update: if isVerified() && isValidId(campaignId) && isValidCampaign(incoming()) && hasImmutableScopeFields() && (
+        isSuperAdmin() ||
+        (isOwnerOrAssignedExisting() && existing().status != 'completed' &&
+         incoming().diff(existing()).affectedKeys().hasOnly(['name', 'campaignType', 'durationDays', 'startDate', 'endDate', 'currency', 'budget', 'status', 'targetMarkets', 'strategySections', 'songId', 'songTitle', 'assignedUserIds', 'updatedAt']))
+      );
+      allow delete: if isValidId(campaignId) && (isSuperAdmin() || (isVerified() && existing().ownerId == request.auth.uid));
+    }
+
+    match /campaign_tasks/{taskId} {
+      allow get: if isValidId(taskId) && isOwnerOrAssignedExisting();
+      allow list: if canListScopedDoc();
+      allow create: if isVerified() && isValidCampaignTask(incoming()) && hasValidCreateScope(taskId);
+      allow update: if isVerified() && isValidId(taskId) && isValidCampaignTask(incoming()) && hasImmutableScopeFields() && (
+        isSuperAdmin() ||
+        (isOwnerOrAssignedExisting() && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'department', 'dueDate', 'priority', 'status', 'notes', 'campaignId', 'campaignName', 'assignedUserIds', 'updatedAt']))
+      );
+      allow delete: if isValidId(taskId) && isOwnerOrAssignedExisting();
+    }
+
+    match /content_ideas/{ideaId} {
+      allow get: if isValidId(ideaId) && isOwnerOrAssignedExisting();
+      allow list: if canListScopedDoc();
+      allow create: if isVerified() && isValidContentIdea(incoming()) && hasValidCreateScope(ideaId);
+      allow update: if isVerified() && isValidId(ideaId) && isValidContentIdea(incoming()) && hasImmutableScopeFields() && (
+        isSuperAdmin() ||
+        (isOwnerOrAssignedExisting() && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'openingHook', 'sceneInstructions', 'onScreenText', 'audioPlacement', 'caption', 'callToAction', 'hashtags', 'isFavorite', 'updatedAt']))
+      );
+      allow delete: if isValidId(ideaId) && isOwnerOrAssignedExisting();
+    }
+
+    match /content_calendar/{itemId} {
+      allow get: if isValidId(itemId) && isOwnerOrAssignedExisting();
+      allow list: if canListScopedDoc();
+      allow create: if isVerified() && isValidContentCalendarItem(incoming()) && hasValidCreateScope(itemId);
+      allow update: if isVerified() && isValidId(itemId) && isValidContentCalendarItem(incoming()) && hasImmutableScopeFields() && (
+        isSuperAdmin() ||
+        (isOwnerOrAssignedExisting() && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'platform', 'scheduledDate', 'format', 'status', 'notes', 'campaignId', 'updatedAt']))
+      );
+      allow delete: if isValidId(itemId) && isOwnerOrAssignedExisting();
+    }
+
+    match /influencer_contacts/{contactId} {
+      allow get: if isValidId(contactId) && isOwnerOrAssignedExisting();
+      allow list: if canListScopedDoc();
+      allow create: if isVerified() && isValidInfluencerContact(incoming()) && hasValidCreateScope(contactId);
+      allow update: if isVerified() && isValidId(contactId) && isValidInfluencerContact(incoming()) && hasImmutableScopeFields() && (
+        isSuperAdmin() ||
+        (isOwnerOrAssignedExisting() && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'handle', 'platform', 'country', 'genreFit', 'sourceType', 'publicContact', 'discussionStatus', 'agreedDeliverables', 'campaignResults', 'outreachDraft', 'updatedAt']))
+      );
+      allow delete: if isValidId(contactId) && isOwnerOrAssignedExisting();
+    }
+
+    match /media_contacts/{contactId} {
+      allow get: if isValidId(contactId) && isOwnerOrAssignedExisting();
+      allow list: if canListScopedDoc();
+      allow create: if isVerified() && isValidMediaContact(incoming()) && hasValidCreateScope(contactId);
+      allow update: if isVerified() && isValidId(contactId) && isValidMediaContact(incoming()) && hasImmutableScopeFields() && (
+        isSuperAdmin() ||
+        (isOwnerOrAssignedExisting() && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'category', 'country', 'location', 'platform', 'publicContact', 'outreachStatus', 'lastContactDate', 'followUpDate', 'notes', 'updatedAt']))
+      );
+      allow delete: if isValidId(contactId) && isOwnerOrAssignedExisting();
+    }
+
+    match /playlist_opportunities/{playlistId} {
+      allow get: if isValidId(playlistId) && isOwnerOrAssignedExisting();
+      allow list: if canListScopedDoc();
+      allow create: if isVerified() && isValidPlaylistOpportunity(incoming()) && hasValidCreateScope(playlistId);
+      allow update: if isVerified() && isValidId(playlistId) && isValidPlaylistOpportunity(incoming()) && hasImmutableScopeFields() && (
+        isSuperAdmin() ||
+        (isOwnerOrAssignedExisting() && incoming().diff(existing()).affectedKeys().hasOnly(['playlistName', 'platform', 'playlistType', 'submissionRequirements', 'submissionLink', 'submissionDate', 'status', 'responseNotes', 'songTitle', 'updatedAt']))
+      );
+      allow delete: if isValidId(playlistId) && isOwnerOrAssignedExisting();
+    }
+
+    match /outreach_history/{logId} {
+      allow get: if isValidId(logId) && isOwnerOrAssignedExisting();
+      allow list: if canListScopedDoc();
+      allow create: if isVerified() && isValidOutreachHistory(incoming()) && hasValidCreateScope(logId) &&
+                       incoming().userAuthorized == true;
+      allow update: if isVerified() && isValidId(logId) && isValidOutreachHistory(incoming()) && hasImmutableScopeFields() && (
+        isSuperAdmin() ||
+        (isOwnerOrAssignedExisting() && incoming().diff(existing()).affectedKeys().hasOnly(['outcome', 'updatedAt']))
+      );
+      allow delete: if isValidId(logId) && isSuperAdmin();
+    }
+
+    match /campaign_metrics/{metricId} {
+      allow get: if isValidId(metricId) && isOwnerOrAssignedExisting();
+      allow list: if canListScopedDoc();
+      allow create: if isVerified() && isValidCampaignMetric(incoming()) && hasValidCreateScope(metricId);
+      allow update: if isVerified() && isValidId(metricId) && isValidCampaignMetric(incoming()) && hasImmutableScopeFields() && (
+        isSuperAdmin() ||
+        (isOwnerOrAssignedExisting() && incoming().diff(existing()).affectedKeys().hasOnly(['reach', 'impressions', 'videoViews', 'engagement', 'shares', 'comments', 'saves', 'linkClicks', 'reportedStreams', 'followersGained', 'adSpend', 'currency', 'recordedDate', 'updatedAt']))
+      );
+      allow delete: if isValidId(metricId) && isOwnerOrAssignedExisting();
+    }
+
+    match /clients/{clientId} {
+      allow get: if isValidId(clientId) && isOwnerOrAssignedExisting();
+      allow list: if canListScopedDoc();
+      allow create: if isVerified() && isValidClient(incoming()) && hasValidCreateScope(clientId);
+      allow update: if isVerified() && isValidId(clientId) && isValidClient(incoming()) && hasImmutableScopeFields() && (
+        isSuperAdmin() ||
+        (isOwnerOrAssignedExisting() && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'email', 'companyOrLabel', 'country', 'packageTier', 'onboardingStatus', 'paymentStatus', 'assignedArtistNames', 'internalNotes', 'communicationHistory', 'assignedUserIds', 'updatedAt']))
+      );
+      allow delete: if isValidId(clientId) && isOwnerOrAssignedExisting();
+    }
+
+    match /service_packages/{packageId} {
+      allow get: if isVerified() && isValidId(packageId);
+      allow list: if isVerified() && (isBootstrappedAdmin() || existing().isPublic == true || existing().ownerId == request.auth.uid);
+      allow create: if isSuperAdmin() && isValidId(packageId) && isValidServicePackage(incoming()) &&
+                       incoming().id == packageId &&
+                       incoming().ownerId == request.auth.uid &&
+                       incoming().createdAt == request.time &&
+                       incoming().updatedAt == request.time;
+      allow update: if isSuperAdmin() && isValidId(packageId) && isValidServicePackage(incoming()) &&
+                       incoming().id == existing().id &&
+                       incoming().ownerId == existing().ownerId &&
+                       incoming().createdAt == existing().createdAt &&
+                       incoming().updatedAt == request.time &&
+                       incoming().diff(existing()).affectedKeys().hasOnly(['title', 'description', 'priceNGN', 'priceUSD', 'isConfigured', 'isPublic', 'campaignLimit', 'deliverables', 'updatedAt']);
+      allow delete: if isSuperAdmin() && isValidId(packageId);
+    }
+
+    match /invoices/{invoiceId} {
+      allow get: if isValidId(invoiceId) && isOwnerOrAssignedExisting();
+      allow list: if canListScopedDoc();
+      allow create: if isVerified() && isValidInvoice(incoming()) && hasValidCreateScope(invoiceId);
+      allow update: if isVerified() && isValidId(invoiceId) && isValidInvoice(incoming()) && hasImmutableScopeFields() && (
+        isSuperAdmin() ||
+        (isOwnerOrAssignedExisting() && !(existing().status in ['paid', 'void']) &&
+         incoming().diff(existing()).affectedKeys().hasOnly(['status', 'notes', 'dueDate', 'updatedAt']) &&
+         incoming().status != 'paid')
+      );
+      allow delete: if isValidId(invoiceId) && isSuperAdmin();
+    }
+
+    match /payments/{paymentId} {
+      allow get: if isValidId(paymentId) && isOwnerOrAssignedExisting();
+      allow list: if canListScopedDoc();
+      allow create: if isVerified() && isValidPayment(incoming()) && hasValidCreateScope(paymentId) &&
+                       incoming().verificationStatus in ['pending', 'awaiting_provider_integration'];
+      allow update: if isSuperAdmin() && isValidId(paymentId) && isValidPayment(incoming()) && hasImmutableScopeFields();
+      allow delete: if isValidId(paymentId) && isSuperAdmin();
+    }
+
+    match /notifications/{notificationId} {
+      allow get: if isValidId(notificationId) && isOwnerOrAssignedExisting();
+      allow list: if canListScopedDoc();
+      allow create: if isVerified() && isValidNotification(incoming()) && hasValidCreateScope(notificationId);
+      allow update: if isVerified() && isValidId(notificationId) && isValidNotification(incoming()) && hasImmutableScopeFields() && (
+        isSuperAdmin() ||
+        (isOwnerOrAssignedExisting() && incoming().diff(existing()).affectedKeys().hasOnly(['read', 'updatedAt']))
+      );
+      allow delete: if isValidId(notificationId) && isOwnerOrAssignedExisting();
+    }
+
+    match /ai_usage_logs/{logId} {
+      allow get: if isValidId(logId) && isOwnerOrAssignedExisting();
+      allow list: if canListScopedDoc();
+      allow create: if isVerified() && isValidAiUsageLog(incoming()) && hasValidCreateScope(logId);
+      allow update: if false;
+      allow delete: if isSuperAdmin() && isValidId(logId);
+    }
+
+    match /ad_plans/{planId} {
+      allow get: if isValidId(planId) && isOwnerOrAssignedExisting();
+      allow list: if canListScopedDoc();
+      allow create: if isVerified() && isValidAdPlan(incoming()) && hasValidCreateScope(planId) &&
+                       incoming().apiExecutionState in ['manual_plan_only', 'awaiting_api_integration'];
+      allow update: if isVerified() && isValidId(planId) && isValidAdPlan(incoming()) && hasImmutableScopeFields() && (
+        isSuperAdmin() ||
+        (isOwnerOrAssignedExisting() && incoming().diff(existing()).affectedKeys().hasOnly(['objective', 'audienceDefinition', 'geoTargeting', 'currency', 'budget', 'durationDays', 'creativeRecommendations', 'adCopy', 'humanConfirmed', 'apiExecutionState', 'updatedAt']))
+      );
+      allow delete: if isValidId(planId) && isOwnerOrAssignedExisting();
+    }
+  }
+}
