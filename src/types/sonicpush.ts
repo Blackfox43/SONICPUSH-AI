@@ -15,6 +15,24 @@ export interface UserProfile {
   updatedAt?: unknown;
 }
 
+export interface ServerAuthSession {
+  uid: string;
+  email: string;
+  emailVerified: boolean;
+  role: UserRole | null;
+  isSuperAdmin: boolean;
+  isBootstrapAdmin: boolean;
+  onboardingCompleted: boolean;
+  organizationId: string;
+  capabilities: {
+    canManageUsers: boolean;
+    canManagePackages: boolean;
+    canManageClients: boolean;
+    canReconcilePayments: boolean;
+    canAccessAdminConsole: boolean;
+  };
+}
+
 export interface Organization {
   id: string;
   ownerId: string;
@@ -90,6 +108,10 @@ export interface Song {
   streamingLink?: string;
   audioFileName?: string;
   audioStorageUrl?: string;
+  audioStoragePath?: string;
+  audioMimeType?: string;
+  audioSignatureFormat?: string;
+  audioRetentionExpiresAt?: string;
   audioProcessed: boolean;
   message: string;
   moodAndStyle: string;
@@ -354,7 +376,17 @@ export interface InvoiceRecord {
   currency: CurrencyCode;
   amount: number;
   dueDate: string;
-  status: 'draft' | 'sent' | 'awaiting_verification' | 'paid' | 'overdue' | 'void';
+  status:
+    | 'draft'
+    | 'sent'
+    | 'awaiting_verification'
+    | 'paid'
+    | 'overdue'
+    | 'void'
+    | 'refunded'
+    | 'disputed';
+  verifiedPaymentRef?: string;
+  paidAt?: string;
   notes?: string;
   createdAt?: unknown;
   updatedAt?: unknown;
@@ -368,9 +400,21 @@ export interface PaymentRecord {
   invoiceId: string;
   provider: 'paystack' | 'flutterwave' | 'stripe' | 'manual_transfer';
   reference: string;
+  providerTransactionId?: string;
   currency: CurrencyCode;
   amount: number;
-  verificationStatus: 'pending' | 'awaiting_provider_integration' | 'verified' | 'failed';
+  verificationStatus:
+    | 'pending'
+    | 'awaiting_provider_integration'
+    | 'verified'
+    | 'failed'
+    | 'refunded'
+    | 'disputed';
+  verificationSource?: 'server_api' | 'webhook' | 'manual_admin';
+  verifiedAt?: string;
+  failureReason?: string;
+  webhookEventId?: string;
+  serverAttestation?: string;
   createdAt?: unknown;
   updatedAt?: unknown;
 }

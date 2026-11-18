@@ -1,6 +1,5 @@
 import React, { createContext, useContext, useEffect, useState, useCallback } from 'react';
 import {
-  BOOTSTRAPPED_ADMIN_EMAIL,
   createScopedDoc,
   makeDocId,
   subscribeScopedCollection,
@@ -24,6 +23,7 @@ import type {
   OutreachHistoryItem,
   PaymentRecord,
   PlaylistOpportunity,
+  ServerAuthSession,
   ServicePackage,
   Song,
   UserProfile,
@@ -33,6 +33,8 @@ import type {
 interface WorkspaceContextValue {
   user: UserProfile;
   isBootstrappedAdmin: boolean;
+  isSuperAdmin: boolean;
+  canManageClients: boolean;
   currency: CurrencyCode;
   setCurrency: (c: CurrencyCode) => Promise<void>;
   activeSection: WorkspaceSection;
@@ -74,9 +76,15 @@ export function useWorkspace(): WorkspaceContextValue {
 
 export const WorkspaceProvider: React.FC<{
   user: UserProfile;
+  sessionAuth?: ServerAuthSession | null;
   children: React.ReactNode;
-}> = ({ user, children }) => {
-  const isBootstrappedAdmin = user.email.toLowerCase() === BOOTSTRAPPED_ADMIN_EMAIL.toLowerCase();
+}> = ({ user, sessionAuth, children }) => {
+  const isSuperAdmin =
+    Boolean(sessionAuth?.isSuperAdmin) || user.role === 'SUPER_ADMIN';
+  const isBootstrappedAdmin = isSuperAdmin;
+  const canManageClients =
+    sessionAuth?.capabilities?.canManageClients ??
+    (user.role === 'SUPER_ADMIN' || user.role === 'PROMOTER');
   const [currency, setCurrencyState] = useState<CurrencyCode>(user.preferredCurrency || 'NGN');
   const [activeSection, setActiveSection] = useState<WorkspaceSection>('dashboard');
   const [assistantOpen, setAssistantOpen] = useState(false);
@@ -130,13 +138,18 @@ export const WorkspaceProvider: React.FC<{
       subscribeScopedCollection<PlaylistOpportunity>('playlist_opportunities', uid, isBootstrappedAdmin, setPlaylists, onSubError),
       subscribeScopedCollection<OutreachHistoryItem>('outreach_history', uid, isBootstrappedAdmin, setOutreachHistory, onSubError),
       subscribeScopedCollection<CampaignMetric>('campaign_metrics', uid, isBootstrappedAdmin, setMetrics, onSubError),
-      subscribeScopedCollection<ClientRecord>('clients', uid, isBootstrappedAdmin, setClients, onSubError),
       subscribeScopedCollection<InvoiceRecord>('invoices', uid, isBootstrappedAdmin, setInvoices, onSubError),
       subscribeScopedCollection<PaymentRecord>('payments', uid, isBootstrappedAdmin, setPayments, onSubError),
       subscribeScopedCollection<NotificationItem>('notifications', uid, isBootstrappedAdmin, setNotifications, onSubError),
       subscribeScopedCollection<AiUsageLog>('ai_usage_logs', uid, isBootstrappedAdmin, setAiUsageLogs, onSubError),
       subscribeScopedCollection<AdPlan>('ad_plans', uid, isBootstrappedAdmin, setAdPlans, onSubError),
     );
+
+    if (canManageClients) {
+      unsubs.push(
+        subscribeScopedCollection<ClientRecord>('clients', uid, isBootstrappedAdmin, setClients, onSubError)
+      );
+    }
 
     // service_packages are public to all authenticated users (or all for admin)
     unsubs.push(
@@ -149,7 +162,7 @@ export const WorkspaceProvider: React.FC<{
       )
     );
 
-    if (isBootstrappedAdmin || user.role === 'SUPER_ADMIN') {
+    if (isSuperAdmin) {
       unsubs.push(
         subscribeScopedCollection<UserProfile>(
           'users',
@@ -166,7 +179,7 @@ export const WorkspaceProvider: React.FC<{
       clearTimeout(timer);
       unsubs.forEach((u) => u());
     };
-  }, [user.uid, user.role, isBootstrappedAdmin]);
+  }, [user.uid, user.role, isBootstrappedAdmin, isSuperAdmin, canManageClients]);
 
   const setCurrency = useCallback(
     async (c: CurrencyCode) => {
@@ -204,6 +217,8 @@ export const WorkspaceProvider: React.FC<{
       value={{
         user,
         isBootstrappedAdmin,
+        isSuperAdmin,
+        canManageClients,
         currency,
         setCurrency,
         activeSection,

@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { Upload, Sparkles, CheckCircle2, AlertCircle, Trash2, Music2 } from 'lucide-react';
-import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
+import { ref, uploadBytes, deleteObject } from 'firebase/storage';
 import { useWorkspace } from '../../context/WorkspaceContext';
 import { useToast } from '../ToastProvider';
 import { postFormApi } from '../../lib/api';
@@ -42,6 +42,7 @@ export const SongIntelligenceView: React.FC = () => {
     setAnalyzing(true);
     try {
       const formData = new FormData();
+      formData.append('organizationId', user.organizationId);
       formData.append('title', title.trim());
       formData.append('artistName', artist.name);
       formData.append('genre', genre.trim());
@@ -56,23 +57,35 @@ export const SongIntelligenceView: React.FC = () => {
       }
 
       const aiRes = await postFormApi<
-        SongIntelligenceResult & { audioFileName?: string; latencyMs?: number; model?: string }
+        SongIntelligenceResult & {
+          audioFileName?: string;
+          audioStoragePath?: string;
+          audioMimeType?: string;
+          audioSignatureFormat?: string;
+          audioRetentionExpiresAt?: string;
+          latencyMs?: number;
+          model?: string;
+        }
       >('/api/ai/song-intelligence', formData);
 
       void logAiUsage('song_intelligence', aiRes.model || 'gemini-4-hydrogen', 'success', aiRes.latencyMs || 0);
 
-      // Optional Firebase Storage upload if bucket is enabled
-      let audioStorageUrl = '';
-      if (audioFile) {
+      // Private Firebase Storage upload using server-generated UUID path + retention metadata
+      let persistedStoragePath = '';
+      if (audioFile && aiRes.audioStoragePath && aiRes.audioMimeType) {
         try {
-          const storageRef = ref(
-            storage,
-            `organizations/${user.organizationId}/audio/${Date.now()}_${audioFile.name.replace(/[^a-zA-Z0-9._-]/g, '_')}`
-          );
-          await uploadBytes(storageRef, audioFile);
-          audioStorageUrl = await getDownloadURL(storageRef);
+          const storageRef = ref(storage, aiRes.audioStoragePath);
+          await uploadBytes(storageRef, audioFile, {
+            contentType: aiRes.audioMimeType,
+            customMetadata: {
+              ownerId: user.uid,
+              organizationId: user.organizationId,
+              retentionExpiresAt: aiRes.audioRetentionExpiresAt || '',
+            },
+          });
+          persistedStoragePath = aiRes.audioStoragePath;
         } catch {
-          // Storage rules or CORS may restrict direct upload; server multimodal analysis already processed audio
+          // Storage rules or CORS may restrict direct upload; server multimodal analysis already processed audio safely
         }
       }
 
@@ -94,8 +107,15 @@ export const SongIntelligenceView: React.FC = () => {
         language: clampStr(language, 100) || 'English',
         releaseDate: clampStr(releaseDate, 40) || 'TBD',
         ...(streamingLink.trim() ? { streamingLink: clampStr(streamingLink, 1024) } : {}),
-        ...(audioFile?.name ? { audioFileName: clampStr(audioFile.name, 240) } : {}),
-        ...(audioStorageUrl ? { audioStorageUrl: clampStr(audioStorageUrl, 1024) } : {}),
+        ...(aiRes.audioFileName ? { audioFileName: clampStr(aiRes.audioFileName, 240) } : {}),
+        ...(persistedStoragePath ? { audioStoragePath: clampStr(persistedStoragePath, 512) } : {}),
+        ...(aiRes.audioMimeType ? { audioMimeType: clampStr(aiRes.audioMimeType, 80) } : {}),
+        ...(aiRes.audioSignatureFormat
+          ? { audioSignatureFormat: clampStr(aiRes.audioSignatureFormat, 40) }
+          : {}),
+        ...(aiRes.audioRetentionExpiresAt
+          ? { audioRetentionExpiresAt: clampStr(aiRes.audioRetentionExpiresAt, 40) }
+          : {}),
         audioProcessed: Boolean(aiRes.audioProcessed),
         message: clampStr(message, 1500),
         moodAndStyle: clampStr(moodAndStyle, 800),
@@ -119,6 +139,13 @@ export const SongIntelligenceView: React.FC = () => {
 
   const handleDeleteSong = async (song: Song) => {
     try {
+      if (song.audioStoragePath) {
+        try {
+          await deleteObject(ref(storage, song.audioStoragePath));
+        } catch {
+          // Object may already be expired/deleted or Storage disabled
+        }
+      }
       await deleteScopedDoc('songs', song.id);
       if (selectedSong?.id === song.id) {
         setSelectedSong(null);
@@ -233,6 +260,9 @@ export const SongIntelligenceView: React.FC = () => {
                   onChange={(e) => setAudioFile(e.target.files?.[0] || null)}
                 />
               </label>
+              <p className="mt-1 text-[11px] text-zinc-500">
+                Server validates binary audio file headers (magic bytes) and private retention metadata; automated antivirus scanning is not performed.
+              </p>
             </div>
 
             <div>

@@ -9,11 +9,11 @@ import type { ClientRecord, PackageTier, ServicePackage } from '../../types/soni
 const PACKAGE_TIERS: PackageTier[] = ['STARTER', 'GROWTH', 'PREMIUM', 'ELITE', 'CUSTOM CAMPAIGN'];
 
 export const ClientsPackagesView: React.FC = () => {
-  const { user, currency, clients, servicePackages } = useWorkspace();
+  const { user, isSuperAdmin, canManageClients, currency, clients, servicePackages } = useWorkspace();
   const { notify } = useToast();
 
-  const isAdmin = user.role === 'SUPER_ADMIN';
-  const isArtist = user.role === 'ARTIST';
+  const isAdmin = isSuperAdmin;
+  const isArtist = !canManageClients;
 
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
@@ -348,6 +348,7 @@ export const ClientsPackagesView: React.FC = () => {
 
                     <select
                       value={cli.paymentStatus}
+                      aria-label="Agency Billing Follow-Up Note"
                       onChange={(e) =>
                         void updateScopedDoc('clients', cli.id, {
                           paymentStatus: e.target.value as ClientRecord['paymentStatus'],
@@ -355,10 +356,10 @@ export const ClientsPackagesView: React.FC = () => {
                       }
                       className="rounded border border-white/10 bg-[#18181E] px-2.5 py-1.5 text-xs text-zinc-200"
                     >
-                      <option value="unpaid">Payment: Unpaid</option>
-                      <option value="pending_verification">Payment: Pending Verification</option>
-                      <option value="paid">Payment: Paid</option>
-                      <option value="overdue">Payment: Overdue</option>
+                      <option value="unpaid">Billing Note: Unpaid</option>
+                      <option value="pending_verification">Billing Note: Pending Verification</option>
+                      <option value="paid">Billing Note: Settled (CRM)</option>
+                      <option value="overdue">Billing Note: Overdue</option>
                     </select>
                   </div>
 

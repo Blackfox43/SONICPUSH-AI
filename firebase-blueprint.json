@@ -82,6 +82,10 @@
         "streamingLink": { "type": "string", "maxLength": 1024 },
         "audioFileName": { "type": "string", "maxLength": 240 },
         "audioStorageUrl": { "type": "string", "maxLength": 1024 },
+        "audioStoragePath": { "type": "string", "maxLength": 512 },
+        "audioMimeType": { "type": "string", "maxLength": 80 },
+        "audioSignatureFormat": { "type": "string", "maxLength": 40 },
+        "audioRetentionExpiresAt": { "type": "string", "maxLength": 40 },
         "audioProcessed": { "type": "boolean" },
         "message": { "type": "string", "maxLength": 1500 },
         "moodAndStyle": { "type": "string", "maxLength": 800 },
@@ -374,7 +378,9 @@
         "currency": { "type": "string", "enum": ["NGN", "USD", "GBP", "EUR"] },
         "amount": { "type": "number" },
         "dueDate": { "type": "string", "maxLength": 40 },
-        "status": { "type": "string", "enum": ["draft", "sent", "awaiting_verification", "paid", "overdue", "void"] },
+        "status": { "type": "string", "enum": ["draft", "sent", "awaiting_verification", "paid", "overdue", "void", "refunded", "disputed"] },
+        "verifiedPaymentRef": { "type": "string", "maxLength": 160 },
+        "paidAt": { "type": "string", "maxLength": 40 },
         "notes": { "type": "string", "maxLength": 1000 },
         "createdAt": { "type": "string", "format": "date-time" },
         "updatedAt": { "type": "string", "format": "date-time" }
@@ -393,9 +399,15 @@
         "invoiceId": { "type": "string", "maxLength": 128 },
         "provider": { "type": "string", "enum": ["paystack", "flutterwave", "stripe", "manual_transfer"] },
         "reference": { "type": "string", "maxLength": 160 },
+        "providerTransactionId": { "type": "string", "maxLength": 160 },
         "currency": { "type": "string", "enum": ["NGN", "USD", "GBP", "EUR"] },
         "amount": { "type": "number" },
-        "verificationStatus": { "type": "string", "enum": ["pending", "awaiting_provider_integration", "verified", "failed"] },
+        "verificationStatus": { "type": "string", "enum": ["pending", "awaiting_provider_integration", "verified", "failed", "refunded", "disputed"] },
+        "verificationSource": { "type": "string", "enum": ["server_api", "webhook", "manual_admin"] },
+        "verifiedAt": { "type": "string", "maxLength": 40 },
+        "failureReason": { "type": "string", "maxLength": 400 },
+        "webhookEventId": { "type": "string", "maxLength": 160 },
+        "serverAttestation": { "type": "string", "maxLength": 256 },
         "createdAt": { "type": "string", "format": "date-time" },
         "updatedAt": { "type": "string", "format": "date-time" }
       },
@@ -463,6 +475,23 @@
         "updatedAt": { "type": "string", "format": "date-time" }
       },
       "required": ["id", "organizationId", "ownerId", "assignedUserIds", "platform", "objective", "currency", "budget", "durationDays", "humanConfirmed", "apiExecutionState", "createdAt", "updatedAt"]
+    },
+    "AdminAuditLog": {
+      "title": "AdminAuditLog",
+      "description": "Immutable Super Admin governance audit trail for role grants, revocations, and billing reconciliation",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "organizationId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "assignedUserIds": { "type": "array" },
+        "action": { "type": "string", "maxLength": 100 },
+        "targetUid": { "type": "string", "maxLength": 128 },
+        "detail": { "type": "string", "maxLength": 500 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "organizationId", "ownerId", "assignedUserIds", "action", "targetUid", "detail", "createdAt", "updatedAt"]
     }
   },
   "firestore": {
@@ -485,6 +514,7 @@
     "/payments/{paymentId}": { "schema": { "$ref": "#/entities/Payment" }, "description": "Payment transaction status records" },
     "/notifications/{notificationId}": { "schema": { "$ref": "#/entities/Notification" }, "description": "Notifications & reminders" },
     "/ai_usage_logs/{logId}": { "schema": { "$ref": "#/entities/AiUsageLog" }, "description": "Gemini AI usage logs" },
-    "/ad_plans/{planId}": { "schema": { "$ref": "#/entities/AdPlan" }, "description": "Advertising campaign plans" }
+    "/ad_plans/{planId}": { "schema": { "$ref": "#/entities/AdPlan" }, "description": "Advertising campaign plans" },
+    "/admin_audit_logs/{logId}": { "schema": { "$ref": "#/entities/AdminAuditLog" }, "description": "Immutable Super Admin audit log" }
   }
 }

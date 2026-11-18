@@ -2,18 +2,20 @@ import React, { useEffect, useState } from 'react';
 import { onAuthStateChanged, signInWithPopup, signOut, type User as FirebaseUser } from 'firebase/auth';
 import { doc, getDoc } from 'firebase/firestore';
 import { auth, db, googleProvider, handleFirestoreError, OperationType } from './lib/firebase';
+import { getJsonApi } from './lib/api';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { ToastProvider } from './components/ToastProvider';
 import { LandingPage } from './components/LandingPage';
 import { OnboardingFlow } from './components/OnboardingFlow';
 import { WorkspaceProvider } from './context/WorkspaceContext';
 import { WorkspaceLayout } from './components/WorkspaceLayout';
-import type { UserProfile } from './types/sonicpush';
+import type { ServerAuthSession, UserProfile } from './types/sonicpush';
 
 function SonicPushRoot() {
   const [authReady, setAuthReady] = useState(false);
   const [firebaseUser, setFirebaseUser] = useState<FirebaseUser | null>(null);
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
+  const [sessionAuth, setSessionAuth] = useState<ServerAuthSession | null>(null);
   const [loadingProfile, setLoadingProfile] = useState(false);
   const [signingIn, setSigningIn] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
@@ -23,13 +25,18 @@ function SonicPushRoot() {
       setFirebaseUser(fbUser);
       if (!fbUser) {
         setUserProfile(null);
+        setSessionAuth(null);
         setAuthReady(true);
         return;
       }
 
       setLoadingProfile(true);
       try {
-        const snap = await getDoc(doc(db, 'users', fbUser.uid));
+        const [snap, serverSession] = await Promise.all([
+          getDoc(doc(db, 'users', fbUser.uid)),
+          getJsonApi<ServerAuthSession>('/api/auth/session').catch(() => null),
+        ]);
+        setSessionAuth(serverSession);
         if (snap.exists()) {
           setUserProfile(snap.data() as UserProfile);
         } else {
@@ -69,6 +76,7 @@ function SonicPushRoot() {
   const handleSignOut = async () => {
     await signOut(auth);
     setUserProfile(null);
+    setSessionAuth(null);
   };
 
   if (!authReady || loadingProfile) {
@@ -99,14 +107,20 @@ function SonicPushRoot() {
         email={firebaseUser.email || ''}
         displayName={firebaseUser.displayName || ''}
         photoURL={firebaseUser.photoURL || undefined}
-        onComplete={(profile) => setUserProfile(profile)}
+        serverCanSuperAdmin={Boolean(sessionAuth?.isSuperAdmin)}
+        onComplete={(profile) => {
+          setUserProfile(profile);
+          void getJsonApi<ServerAuthSession>('/api/auth/session')
+            .then((s) => setSessionAuth(s))
+            .catch(() => null);
+        }}
         onSignOut={handleSignOut}
       />
     );
   }
 
   return (
-    <WorkspaceProvider user={userProfile}>
+    <WorkspaceProvider user={userProfile} sessionAuth={sessionAuth}>
       <WorkspaceLayout onSignOut={handleSignOut} />
     </WorkspaceProvider>
   );

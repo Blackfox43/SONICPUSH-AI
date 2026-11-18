@@ -1,21 +1,44 @@
-import React, { useState } from 'react';
-import { CreditCard, ShieldCheck, Plus, RefreshCw, AlertTriangle } from 'lucide-react';
+import React, { useEffect, useState, useCallback } from 'react';
+import { CreditCard, ShieldCheck, Plus, RefreshCw, AlertTriangle, CheckCircle2 } from 'lucide-react';
 import { useWorkspace } from '../../context/WorkspaceContext';
 import { useToast } from '../ToastProvider';
-import { postJsonApi } from '../../lib/api';
+import { getJsonApi, postJsonApi } from '../../lib/api';
 import { formatMoney } from '../../lib/currency';
-import { clampStr, createScopedDoc, makeDocId, updateScopedDoc } from '../../lib/firebase';
+import { clampStr, createScopedDoc, makeDocId } from '../../lib/firebase';
 import type { CurrencyCode, InvoiceRecord, PaymentRecord, UserRole } from '../../types/sonicpush';
+
+interface ServerLedgerResponse {
+  bindings: Array<{
+    bindingKey: string;
+    provider: string;
+    reference: string;
+    invoiceId: string;
+    verificationStatus: string;
+    providerTransactionId?: string;
+    updatedAt: string;
+  }>;
+  webhooks: Array<{
+    idempotencyKey: string;
+    provider: string;
+    eventId: string;
+    eventType: string;
+    reference: string;
+    outcome: string;
+    processedAt: string;
+    note?: string;
+  }>;
+}
 
 export const PaymentsAdminView: React.FC<{ initialTab?: 'payments' | 'admin' }> = ({
   initialTab = 'payments',
 }) => {
-  const { user, currency, invoices, payments, aiUsageLogs, allUsers, artists, campaigns } =
+  const { user, isSuperAdmin, currency, invoices, payments, aiUsageLogs, allUsers, artists, campaigns } =
     useWorkspace();
   const { notify } = useToast();
 
-  const isAdmin = user.role === 'SUPER_ADMIN';
-  const [tab, setTab] = useState<'payments' | 'admin'>(initialTab === 'admin' && isAdmin ? 'admin' : 'payments');
+  const [tab, setTab] = useState<'payments' | 'admin'>(
+    initialTab === 'admin' && isSuperAdmin ? 'admin' : 'payments'
+  );
 
   // Invoice form
   const [clientName, setClientName] = useState('');
@@ -30,7 +53,24 @@ export const PaymentsAdminView: React.FC<{ initialTab?: 'payments' | 'admin' }> 
   const [selectedInvoiceId, setSelectedInvoiceId] = useState('');
   const [provider, setProvider] = useState<PaymentRecord['provider']>('paystack');
   const [reference, setReference] = useState('');
+  const [transactionId, setTransactionId] = useState('');
   const [verifying, setVerifying] = useState(false);
+  const [serverLedger, setServerLedger] = useState<ServerLedgerResponse>({ bindings: [], webhooks: [] });
+
+  const refreshServerLedger = useCallback(async () => {
+    try {
+      const data = await getJsonApi<ServerLedgerResponse>(
+        `/api/payments/ledger?organizationId=${encodeURIComponent(user.organizationId)}`
+      );
+      setServerLedger(data);
+    } catch {
+      // Non-blocking if ledger endpoint is momentarily unreachable
+    }
+  }, [user.organizationId]);
+
+  useEffect(() => {
+    void refreshServerLedger();
+  }, [refreshServerLedger]);
 
   const handleCreateInvoice = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -69,30 +109,59 @@ export const PaymentsAdminView: React.FC<{ initialTab?: 'payments' | 'admin' }> 
 
     setVerifying(true);
     try {
+      // Server retrieves the authoritative invoice & expected minor-unit amount directly from Firestore
       const verifyRes = await postJsonApi<{
         verified: boolean;
         verificationStatus: PaymentRecord['verificationStatus'];
+        providerTransactionId?: string;
+        serverAttestation?: string;
+        invoiceReconciled?: boolean;
         message?: string;
       }>('/api/payments/verify', {
+        invoiceId: inv.id,
         provider,
         reference: reference.trim(),
+        ...(transactionId.trim() ? { transactionId: transactionId.trim() } : {}),
       });
 
-      await createScopedDoc('payments', makeDocId('pay'), {
+      const paymentId = makeDocId('pay');
+      // Client create strictly records server-bound non-settled state; verified reconciliation happens via server endpoint
+      const initialCreateStatus: 'pending' | 'awaiting_provider_integration' =
+        verifyRes.verificationStatus === 'awaiting_provider_integration'
+          ? 'awaiting_provider_integration'
+          : 'pending';
+
+      await createScopedDoc('payments', paymentId, {
         organizationId: user.organizationId,
         ownerId: user.uid,
         assignedUserIds: [user.uid],
         invoiceId: inv.id,
         provider,
         reference: clampStr(reference, 160),
+        ...(verifyRes.providerTransactionId
+          ? { providerTransactionId: clampStr(verifyRes.providerTransactionId, 160) }
+          : {}),
         currency: inv.currency,
         amount: inv.amount,
-        // Firestore rules strictly forbid non-admins from setting verified directly; admin/webhook sets verified
-        verificationStatus:
-          isAdmin && verifyRes.verified ? 'verified' : 'awaiting_provider_integration',
+        verificationStatus: initialCreateStatus,
+        verificationSource: 'server_api',
+        ...(verifyRes.serverAttestation
+          ? { serverAttestation: clampStr(verifyRes.serverAttestation, 256) }
+          : {}),
       });
 
+      if (isSuperAdmin && verifyRes.verified) {
+        await postJsonApi('/api/payments/reconcile', {
+          invoiceId: inv.id,
+          paymentId,
+          provider,
+          reference: reference.trim(),
+        });
+      }
+
       setReference('');
+      setTransactionId('');
+      await refreshServerLedger();
       notify(
         verifyRes.message ||
           (verifyRes.verified
@@ -107,10 +176,34 @@ export const PaymentsAdminView: React.FC<{ initialTab?: 'payments' | 'admin' }> 
     }
   };
 
+  const handleReconcilePayment = async (p: PaymentRecord) => {
+    if (!isSuperAdmin) return;
+    try {
+      await postJsonApi('/api/payments/reconcile', {
+        invoiceId: p.invoiceId,
+        paymentId: p.id,
+        provider: p.provider,
+        reference: p.reference,
+      });
+      await refreshServerLedger();
+      notify(`Reconciled payment reference ${p.reference}.`, 'success');
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Reconciliation requires verified server/webhook confirmation.', 'error');
+    }
+  };
+
   const handleRoleUpdate = async (targetUid: string, role: UserRole) => {
     try {
-      await updateScopedDoc('users', targetUid, { role });
-      notify(`Updated user role to ${role}.`, 'success');
+      await postJsonApi(`/api/admin/users/${encodeURIComponent(targetUid)}/role`, { role });
+      await createScopedDoc('admin_audit_logs', makeDocId('audit'), {
+        organizationId: user.organizationId,
+        ownerId: user.uid,
+        assignedUserIds: [user.uid],
+        action: 'user_role_updated',
+        targetUid,
+        detail: `Changed role to ${role}`,
+      });
+      notify(`Updated user role to ${role} via server governance endpoint.`, 'success');
     } catch (err) {
       notify(err instanceof Error ? err.message : 'Failed to update user role.', 'error');
     }
@@ -124,11 +217,11 @@ export const PaymentsAdminView: React.FC<{ initialTab?: 'payments' | 'admin' }> 
             {tab === 'admin' ? 'Super Admin Governance & AI Telemetry' : 'Payments, Invoices & Subscriptions'}
           </h1>
           <p className="text-sm text-zinc-400">
-            Manage campaign invoices, Paystack / Flutterwave / Stripe verification status, and platform governance.
+            Server-verified Paystack, Flutterwave, and Stripe reconciliation with idempotent raw-body webhook validation.
           </p>
         </div>
 
-        {isAdmin && (
+        {isSuperAdmin && (
           <div className="inline-flex items-center gap-1 p-1 rounded-lg bg-[#121216] border border-white/10">
             <button
               type="button"
@@ -152,7 +245,7 @@ export const PaymentsAdminView: React.FC<{ initialTab?: 'payments' | 'admin' }> 
         )}
       </div>
 
-      {tab === 'admin' && isAdmin ? (
+      {tab === 'admin' && isSuperAdmin ? (
         <div className="space-y-6">
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
             <div className="rounded-xl border border-white/10 bg-[#121216] p-4">
@@ -256,7 +349,7 @@ export const PaymentsAdminView: React.FC<{ initialTab?: 'payments' | 'admin' }> 
           <div className="rounded-lg border border-amber-500/30 bg-amber-950/15 p-4 flex items-start gap-2.5 text-xs text-amber-200">
             <AlertTriangle className="h-4 w-4 text-amber-400 shrink-0 mt-0.5" />
             <span>
-              <strong>Payment Gateway Architecture Ready (No Simulated Success):</strong> Paystack, Flutterwave, and Stripe verification endpoints require server-side merchant keys and webhook secrets. Until live credentials are added, submitted references remain in <code className="font-mono-tabular">awaiting_provider_integration</code> state.
+              <strong>Fail-Closed Gateway Verification Active:</strong> Paystack, Flutterwave, and Stripe verify amounts in minor units against your authoritative server invoice record and check reference uniqueness across organizations. Until live provider keys are supplied in server environment variables, submissions remain <code className="font-mono-tabular">awaiting_provider_integration</code>.
             </span>
           </div>
 
@@ -352,7 +445,7 @@ export const PaymentsAdminView: React.FC<{ initialTab?: 'payments' | 'admin' }> 
                   ) : (
                     invoices.map((inv) => (
                       <option key={inv.id} value={inv.id}>
-                        {inv.clientName} ({formatMoney(inv.amount, inv.currency)})
+                        {inv.clientName} ({formatMoney(inv.amount, inv.currency)} · {inv.status})
                       </option>
                     ))
                   )}
@@ -365,7 +458,7 @@ export const PaymentsAdminView: React.FC<{ initialTab?: 'payments' | 'admin' }> 
                 >
                   <option value="paystack">Paystack</option>
                   <option value="flutterwave">Flutterwave</option>
-                  <option value="stripe">Stripe</option>
+                  <option value="stripe">Stripe (cs_... / pi_...)</option>
                   <option value="manual_transfer">Manual Bank Transfer</option>
                 </select>
               </div>
@@ -374,16 +467,25 @@ export const PaymentsAdminView: React.FC<{ initialTab?: 'payments' | 'admin' }> 
                 required
                 value={reference}
                 onChange={(e) => setReference(e.target.value)}
-                placeholder="Gateway Transaction Reference (e.g. PSK_...)"
+                placeholder="Gateway Transaction Reference (e.g. PSK_..., cs_test_...)"
                 className="w-full rounded-lg border border-white/10 bg-[#18181E] px-3 py-2 text-sm text-white font-mono-tabular"
               />
+              {provider === 'flutterwave' && (
+                <input
+                  type="text"
+                  value={transactionId}
+                  onChange={(e) => setTransactionId(e.target.value)}
+                  placeholder="Optional Flutterwave numeric transaction_id"
+                  className="w-full rounded-lg border border-white/10 bg-[#18181E] px-3 py-2 text-sm text-white font-mono-tabular"
+                />
+              )}
               <button
                 type="submit"
                 disabled={verifying || invoices.length === 0}
                 className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-lg bg-[#8B5CF6] text-white hover:bg-[#7C3AED] disabled:opacity-50"
               >
                 <RefreshCw className="h-3.5 w-3.5" />
-                {verifying ? 'Checking Server Verification...' : 'Check Server Verification'}
+                {verifying ? 'Verifying with Server...' : 'Verify Payment Server-Side'}
               </button>
             </form>
           </div>
@@ -427,8 +529,13 @@ export const PaymentsAdminView: React.FC<{ initialTab?: 'payments' | 'admin' }> 
             </div>
 
             <div className="rounded-xl border border-white/10 bg-[#121216] overflow-x-auto">
-              <div className="p-4 border-b border-white/10">
-                <h3 className="font-display text-sm font-semibold text-white">Payment Verification Ledger ({payments.length})</h3>
+              <div className="p-4 border-b border-white/10 flex items-center justify-between">
+                <h3 className="font-display text-sm font-semibold text-white">
+                  Payment Verification Ledger ({payments.length})
+                </h3>
+                <span className="font-mono-tabular text-[11px] text-zinc-400">
+                  {serverLedger.webhooks.length} webhook events
+                </span>
               </div>
               {payments.length === 0 ? (
                 <p className="p-6 text-xs text-zinc-500">No payment verification records yet.</p>
@@ -439,23 +546,55 @@ export const PaymentsAdminView: React.FC<{ initialTab?: 'payments' | 'admin' }> 
                       <th className="py-2.5 px-4">Provider & Ref</th>
                       <th className="py-2.5 px-4">Amount</th>
                       <th className="py-2.5 px-4">Verification</th>
+                      {isSuperAdmin && <th className="py-2.5 px-4 text-right">Action</th>}
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-white/10">
-                    {payments.map((p) => (
-                      <tr key={p.id}>
-                        <td className="py-2.5 px-4">
-                          <p className="font-medium text-white uppercase">{p.provider}</p>
-                          <p className="font-mono-tabular text-zinc-400">{p.reference}</p>
-                        </td>
-                        <td className="py-2.5 px-4 font-mono-tabular text-zinc-200">
-                          {formatMoney(p.amount, p.currency)}
-                        </td>
-                        <td className="py-2.5 px-4 text-amber-300">
-                          {p.verificationStatus.replace(/_/g, ' ')}
-                        </td>
-                      </tr>
-                    ))}
+                    {payments.map((p) => {
+                      const binding = serverLedger.bindings.find(
+                        (b) => b.provider === p.provider && b.reference === p.reference
+                      );
+                      const displayStatus = binding?.verificationStatus || p.verificationStatus;
+                      return (
+                        <tr key={p.id}>
+                          <td className="py-2.5 px-4">
+                            <p className="font-medium text-white uppercase">{p.provider}</p>
+                            <p className="font-mono-tabular text-zinc-400">{p.reference}</p>
+                          </td>
+                          <td className="py-2.5 px-4 font-mono-tabular text-zinc-200">
+                            {formatMoney(p.amount, p.currency)}
+                          </td>
+                          <td
+                            className={`py-2.5 px-4 ${
+                              displayStatus === 'verified'
+                                ? 'text-emerald-400'
+                                : displayStatus === 'failed' || displayStatus === 'disputed'
+                                ? 'text-red-400'
+                                : 'text-amber-300'
+                            }`}
+                          >
+                            {displayStatus.replace(/_/g, ' ')}
+                          </td>
+                          {isSuperAdmin && (
+                            <td className="py-2.5 px-4 text-right">
+                              {p.verificationStatus !== displayStatus ||
+                              (displayStatus === 'verified' && p.verificationStatus !== 'verified') ? (
+                                <button
+                                  type="button"
+                                  onClick={() => void handleReconcilePayment(p)}
+                                  className="inline-flex items-center gap-1 text-emerald-400 hover:underline"
+                                >
+                                  <CheckCircle2 className="h-3.5 w-3.5" />
+                                  Reconcile
+                                </button>
+                              ) : (
+                                <span className="text-zinc-500">—</span>
+                              )}
+                            </td>
+                          )}
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               )}

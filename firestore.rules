@@ -32,15 +32,34 @@ service cloud.firestore {
       return isSignedIn() && request.auth.token.email_verified == true;
     }
 
+    function hasAdminClaim() {
+      return isVerified() && (
+        request.auth.token.superAdmin == true ||
+        request.auth.token.role == 'SUPER_ADMIN'
+      );
+    }
+
     function isBootstrappedAdmin() {
       return isVerified() && request.auth.token.email == 'emma432cent@gmail.com';
     }
 
+    function hasAdminListAccess() {
+      return isBootstrappedAdmin() || hasAdminClaim();
+    }
+
     function isSuperAdmin() {
-      return isBootstrappedAdmin() || (
+      return isBootstrappedAdmin() || hasAdminClaim() || (
         isVerified() &&
         exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'SUPER_ADMIN'
+      );
+    }
+
+    function isPromoterOrAdmin() {
+      return isSuperAdmin() || (
+        isVerified() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role in ['PROMOTER', 'SUPER_ADMIN']
       );
     }
 
@@ -56,6 +75,17 @@ service cloud.firestore {
       return arr is list && arr.size() >= 1 && arr.size() <= 25 && arr[0] is string && request.auth.uid in arr;
     }
 
+    function isOrgMember(orgId) {
+      return isVerified() && isValidId(orgId) && (
+        isSuperAdmin() || (
+          exists(/databases/$(database)/documents/organizations/$(orgId)) && (
+            get(/databases/$(database)/documents/organizations/$(orgId)).data.ownerId == request.auth.uid ||
+            request.auth.uid in get(/databases/$(database)/documents/organizations/$(orgId)).data.assignedUserIds
+          )
+        )
+      );
+    }
+
     function isOwnerOrAssignedExisting() {
       return isVerified() && (
         existing().ownerId == request.auth.uid ||
@@ -66,7 +96,7 @@ service cloud.firestore {
 
     function canListScopedDoc() {
       return isVerified() && (
-        isBootstrappedAdmin() ||
+        hasAdminListAccess() ||
         existing().ownerId == request.auth.uid ||
         (existing().assignedUserIds is list && request.auth.uid in existing().assignedUserIds)
       );
@@ -77,7 +107,11 @@ service cloud.firestore {
              incoming().organizationId == existing().organizationId &&
              incoming().ownerId == existing().ownerId &&
              incoming().createdAt == existing().createdAt &&
-             incoming().updatedAt == request.time;
+             incoming().updatedAt == request.time &&
+             incoming().assignedUserIds is list &&
+             incoming().assignedUserIds.size() >= 1 &&
+             incoming().assignedUserIds.size() <= 25 &&
+             existing().ownerId in incoming().assignedUserIds;
     }
 
     function hasValidCreateScope(docId) {
@@ -146,7 +180,7 @@ service cloud.firestore {
 
     function isValidSong(data) {
       return data.keys().hasAll(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'artistId', 'artistName', 'title', 'genre', 'language', 'releaseDate', 'audioProcessed', 'message', 'moodAndStyle', 'createdAt', 'updatedAt']) &&
-             data.keys().hasOnly(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'artistId', 'artistName', 'title', 'genre', 'language', 'releaseDate', 'streamingLink', 'audioFileName', 'audioStorageUrl', 'audioProcessed', 'message', 'moodAndStyle', 'lyrics', 'intelligence', 'createdAt', 'updatedAt']) &&
+             data.keys().hasOnly(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'artistId', 'artistName', 'title', 'genre', 'language', 'releaseDate', 'streamingLink', 'audioFileName', 'audioStorageUrl', 'audioStoragePath', 'audioMimeType', 'audioSignatureFormat', 'audioRetentionExpiresAt', 'audioProcessed', 'message', 'moodAndStyle', 'lyrics', 'intelligence', 'createdAt', 'updatedAt']) &&
              isValidId(data.artistId) &&
              data.artistName is string && data.artistName.size() <= 140 &&
              data.title is string && data.title.size() >= 1 && data.title.size() <= 180 &&
@@ -156,6 +190,10 @@ service cloud.firestore {
              (!('streamingLink' in data) || (data.streamingLink is string && data.streamingLink.size() <= 1024)) &&
              (!('audioFileName' in data) || (data.audioFileName is string && data.audioFileName.size() <= 240)) &&
              (!('audioStorageUrl' in data) || (data.audioStorageUrl is string && data.audioStorageUrl.size() <= 1024)) &&
+             (!('audioStoragePath' in data) || (data.audioStoragePath is string && data.audioStoragePath.size() <= 512)) &&
+             (!('audioMimeType' in data) || (data.audioMimeType is string && data.audioMimeType.size() <= 80)) &&
+             (!('audioSignatureFormat' in data) || (data.audioSignatureFormat is string && data.audioSignatureFormat.size() <= 40)) &&
+             (!('audioRetentionExpiresAt' in data) || (data.audioRetentionExpiresAt is string && data.audioRetentionExpiresAt.size() <= 40)) &&
              data.audioProcessed is bool &&
              data.message is string && data.message.size() <= 1500 &&
              data.moodAndStyle is string && data.moodAndStyle.size() <= 800 &&
@@ -360,14 +398,16 @@ service cloud.firestore {
 
     function isValidInvoice(data) {
       return data.keys().hasAll(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'clientName', 'billingType', 'currency', 'amount', 'dueDate', 'status', 'createdAt', 'updatedAt']) &&
-             data.keys().hasOnly(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'clientName', 'packageTier', 'billingType', 'currency', 'amount', 'dueDate', 'status', 'notes', 'createdAt', 'updatedAt']) &&
+             data.keys().hasOnly(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'clientName', 'packageTier', 'billingType', 'currency', 'amount', 'dueDate', 'status', 'verifiedPaymentRef', 'paidAt', 'notes', 'createdAt', 'updatedAt']) &&
              data.clientName is string && data.clientName.size() >= 1 && data.clientName.size() <= 160 &&
              (!('packageTier' in data) || (data.packageTier is string && data.packageTier.size() <= 80)) &&
              data.billingType in ['one_time_campaign', 'monthly_subscription', 'agency_package', 'custom_project'] &&
              isValidCurrency(data.currency) &&
              data.amount is number && data.amount >= 0 &&
              data.dueDate is string && data.dueDate.size() <= 40 &&
-             data.status in ['draft', 'sent', 'awaiting_verification', 'paid', 'overdue', 'void'] &&
+             data.status in ['draft', 'sent', 'awaiting_verification', 'paid', 'overdue', 'void', 'refunded', 'disputed'] &&
+             (!('verifiedPaymentRef' in data) || (data.verifiedPaymentRef is string && data.verifiedPaymentRef.size() <= 160)) &&
+             (!('paidAt' in data) || (data.paidAt is string && data.paidAt.size() <= 40)) &&
              (!('notes' in data) || (data.notes is string && data.notes.size() <= 1000)) &&
              data.createdAt is timestamp &&
              data.updatedAt is timestamp;
@@ -375,13 +415,19 @@ service cloud.firestore {
 
     function isValidPayment(data) {
       return data.keys().hasAll(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'invoiceId', 'provider', 'reference', 'currency', 'amount', 'verificationStatus', 'createdAt', 'updatedAt']) &&
-             data.keys().hasOnly(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'invoiceId', 'provider', 'reference', 'currency', 'amount', 'verificationStatus', 'createdAt', 'updatedAt']) &&
+             data.keys().hasOnly(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'invoiceId', 'provider', 'reference', 'providerTransactionId', 'currency', 'amount', 'verificationStatus', 'verificationSource', 'verifiedAt', 'failureReason', 'webhookEventId', 'serverAttestation', 'createdAt', 'updatedAt']) &&
              isValidId(data.invoiceId) &&
              data.provider in ['paystack', 'flutterwave', 'stripe', 'manual_transfer'] &&
              data.reference is string && data.reference.size() >= 1 && data.reference.size() <= 160 &&
+             (!('providerTransactionId' in data) || (data.providerTransactionId is string && data.providerTransactionId.size() <= 160)) &&
              isValidCurrency(data.currency) &&
              data.amount is number && data.amount >= 0 &&
-             data.verificationStatus in ['pending', 'awaiting_provider_integration', 'verified', 'failed'] &&
+             data.verificationStatus in ['pending', 'awaiting_provider_integration', 'verified', 'failed', 'refunded', 'disputed'] &&
+             (!('verificationSource' in data) || data.verificationSource in ['server_api', 'webhook', 'manual_admin']) &&
+             (!('verifiedAt' in data) || (data.verifiedAt is string && data.verifiedAt.size() <= 40)) &&
+             (!('failureReason' in data) || (data.failureReason is string && data.failureReason.size() <= 400)) &&
+             (!('webhookEventId' in data) || (data.webhookEventId is string && data.webhookEventId.size() <= 160)) &&
+             (!('serverAttestation' in data) || (data.serverAttestation is string && data.serverAttestation.size() <= 256)) &&
              data.createdAt is timestamp &&
              data.updatedAt is timestamp;
     }
@@ -428,31 +474,48 @@ service cloud.firestore {
              data.updatedAt is timestamp;
     }
 
+    function isValidAdminAuditLog(data) {
+      return data.keys().hasAll(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'action', 'targetUid', 'detail', 'createdAt', 'updatedAt']) &&
+             data.keys().hasOnly(['id', 'organizationId', 'ownerId', 'assignedUserIds', 'action', 'targetUid', 'detail', 'createdAt', 'updatedAt']) &&
+             data.action is string && data.action.size() >= 1 && data.action.size() <= 100 &&
+             isValidId(data.targetUid) &&
+             data.detail is string && data.detail.size() <= 500 &&
+             data.createdAt is timestamp &&
+             data.updatedAt is timestamp;
+    }
+
     // -------------------------------------------------------------------------
     // Collection Rules
     // -------------------------------------------------------------------------
     match /users/{userId} {
       allow get: if isVerified() && isValidId(userId) && (request.auth.uid == userId || isSuperAdmin());
-      allow list: if isVerified() && (isBootstrappedAdmin() || existing().ownerId == request.auth.uid);
+      allow list: if isVerified() && (hasAdminListAccess() || existing().ownerId == request.auth.uid);
       allow create: if isVerified() && isValidId(userId) && isValidUser(incoming()) &&
                        userId == request.auth.uid &&
                        incoming().uid == request.auth.uid &&
                        incoming().ownerId == request.auth.uid &&
                        incoming().createdAt == request.time &&
                        incoming().updatedAt == request.time &&
-                       (incoming().role in ['ARTIST', 'PROMOTER'] || (isBootstrappedAdmin() && incoming().role == 'SUPER_ADMIN'));
+                       (
+                         (exists(/databases/$(database)/documents/organizations/$(incoming().organizationId)) &&
+                          get(/databases/$(database)/documents/organizations/$(incoming().organizationId)).data.ownerId == request.auth.uid) ||
+                         (existsAfter(/databases/$(database)/documents/organizations/$(incoming().organizationId)) &&
+                          getAfter(/databases/$(database)/documents/organizations/$(incoming().organizationId)).data.ownerId == request.auth.uid)
+                       ) &&
+                       (incoming().role in ['ARTIST', 'PROMOTER'] || ((isBootstrappedAdmin() || hasAdminClaim()) && incoming().role == 'SUPER_ADMIN'));
       allow update: if isVerified() && isValidId(userId) && isValidUser(incoming()) &&
                        incoming().uid == existing().uid &&
                        incoming().ownerId == existing().ownerId &&
                        incoming().createdAt == existing().createdAt &&
                        incoming().updatedAt == request.time && (
-                         isSuperAdmin() ||
+                         (isSuperAdmin() &&
+                          !(existing().email == 'emma432cent@gmail.com' && incoming().role != 'SUPER_ADMIN')) ||
                          (request.auth.uid == userId &&
                           incoming().role == existing().role &&
                           incoming().organizationId == existing().organizationId &&
                           incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoURL', 'preferredCurrency', 'onboardingCompleted', 'updatedAt']))
                        );
-      allow delete: if isSuperAdmin() && isValidId(userId);
+      allow delete: if false;
     }
 
     match /organizations/{orgId} {
@@ -468,7 +531,8 @@ service cloud.firestore {
                        incoming().id == existing().id &&
                        incoming().ownerId == existing().ownerId &&
                        incoming().createdAt == existing().createdAt &&
-                       incoming().updatedAt == request.time && (
+                       incoming().updatedAt == request.time &&
+                       existing().ownerId in incoming().assignedUserIds && (
                          isSuperAdmin() ||
                          (existing().ownerId == request.auth.uid &&
                           incoming().diff(existing()).affectedKeys().hasOnly(['name', 'type', 'country', 'defaultCurrency', 'assignedUserIds', 'updatedAt']))
@@ -479,7 +543,7 @@ service cloud.firestore {
     match /artists/{artistId} {
       allow get: if isValidId(artistId) && isOwnerOrAssignedExisting();
       allow list: if canListScopedDoc();
-      allow create: if isVerified() && isValidArtist(incoming()) && hasValidCreateScope(artistId);
+      allow create: if isVerified() && isValidArtist(incoming()) && hasValidCreateScope(artistId) && isOrgMember(incoming().organizationId);
       allow update: if isVerified() && isValidId(artistId) && isValidArtist(incoming()) && hasImmutableScopeFields() && (
         isSuperAdmin() ||
         (isOwnerOrAssignedExisting() && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'avatarUrl', 'bio', 'country', 'city', 'genre', 'languages', 'targetAudience', 'socialLinks', 'streamingLinks', 'labelOrManagement', 'careerStage', 'marketingObjectives', 'archived', 'assignedUserIds', 'updatedAt']))
@@ -490,12 +554,13 @@ service cloud.firestore {
     match /songs/{songId} {
       allow get: if isValidId(songId) && isOwnerOrAssignedExisting();
       allow list: if canListScopedDoc();
-      allow create: if isVerified() && isValidSong(incoming()) && hasValidCreateScope(songId) &&
-                       exists(/databases/$(database)/documents/artists/$(incoming().artistId));
+      allow create: if isVerified() && isValidSong(incoming()) && hasValidCreateScope(songId) && isOrgMember(incoming().organizationId) &&
+                       exists(/databases/$(database)/documents/artists/$(incoming().artistId)) &&
+                       get(/databases/$(database)/documents/artists/$(incoming().artistId)).data.organizationId == incoming().organizationId;
       allow update: if isVerified() && isValidId(songId) && isValidSong(incoming()) && hasImmutableScopeFields() &&
                        incoming().artistId == existing().artistId && (
         isSuperAdmin() ||
-        (isOwnerOrAssignedExisting() && incoming().diff(existing()).affectedKeys().hasOnly(['artistName', 'title', 'genre', 'language', 'releaseDate', 'streamingLink', 'audioFileName', 'audioStorageUrl', 'audioProcessed', 'message', 'moodAndStyle', 'lyrics', 'intelligence', 'assignedUserIds', 'updatedAt']))
+        (isOwnerOrAssignedExisting() && incoming().diff(existing()).affectedKeys().hasOnly(['artistName', 'title', 'genre', 'language', 'releaseDate', 'streamingLink', 'audioFileName', 'audioStorageUrl', 'audioStoragePath', 'audioMimeType', 'audioSignatureFormat', 'audioRetentionExpiresAt', 'audioProcessed', 'message', 'moodAndStyle', 'lyrics', 'intelligence', 'assignedUserIds', 'updatedAt']))
       );
       allow delete: if isValidId(songId) && (isSuperAdmin() || (isVerified() && existing().ownerId == request.auth.uid));
     }
@@ -503,8 +568,9 @@ service cloud.firestore {
     match /campaigns/{campaignId} {
       allow get: if isValidId(campaignId) && isOwnerOrAssignedExisting();
       allow list: if canListScopedDoc();
-      allow create: if isVerified() && isValidCampaign(incoming()) && hasValidCreateScope(campaignId) &&
-                       exists(/databases/$(database)/documents/artists/$(incoming().artistId));
+      allow create: if isVerified() && isValidCampaign(incoming()) && hasValidCreateScope(campaignId) && isOrgMember(incoming().organizationId) &&
+                       exists(/databases/$(database)/documents/artists/$(incoming().artistId)) &&
+                       get(/databases/$(database)/documents/artists/$(incoming().artistId)).data.organizationId == incoming().organizationId;
       allow update: if isVerified() && isValidId(campaignId) && isValidCampaign(incoming()) && hasImmutableScopeFields() && (
         isSuperAdmin() ||
         (isOwnerOrAssignedExisting() && existing().status != 'completed' &&
@@ -516,7 +582,7 @@ service cloud.firestore {
     match /campaign_tasks/{taskId} {
       allow get: if isValidId(taskId) && isOwnerOrAssignedExisting();
       allow list: if canListScopedDoc();
-      allow create: if isVerified() && isValidCampaignTask(incoming()) && hasValidCreateScope(taskId);
+      allow create: if isVerified() && isValidCampaignTask(incoming()) && hasValidCreateScope(taskId) && isOrgMember(incoming().organizationId);
       allow update: if isVerified() && isValidId(taskId) && isValidCampaignTask(incoming()) && hasImmutableScopeFields() && (
         isSuperAdmin() ||
         (isOwnerOrAssignedExisting() && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'department', 'dueDate', 'priority', 'status', 'notes', 'campaignId', 'campaignName', 'assignedUserIds', 'updatedAt']))
@@ -527,7 +593,7 @@ service cloud.firestore {
     match /content_ideas/{ideaId} {
       allow get: if isValidId(ideaId) && isOwnerOrAssignedExisting();
       allow list: if canListScopedDoc();
-      allow create: if isVerified() && isValidContentIdea(incoming()) && hasValidCreateScope(ideaId);
+      allow create: if isVerified() && isValidContentIdea(incoming()) && hasValidCreateScope(ideaId) && isOrgMember(incoming().organizationId);
       allow update: if isVerified() && isValidId(ideaId) && isValidContentIdea(incoming()) && hasImmutableScopeFields() && (
         isSuperAdmin() ||
         (isOwnerOrAssignedExisting() && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'openingHook', 'sceneInstructions', 'onScreenText', 'audioPlacement', 'caption', 'callToAction', 'hashtags', 'isFavorite', 'updatedAt']))
@@ -538,7 +604,7 @@ service cloud.firestore {
     match /content_calendar/{itemId} {
       allow get: if isValidId(itemId) && isOwnerOrAssignedExisting();
       allow list: if canListScopedDoc();
-      allow create: if isVerified() && isValidContentCalendarItem(incoming()) && hasValidCreateScope(itemId);
+      allow create: if isVerified() && isValidContentCalendarItem(incoming()) && hasValidCreateScope(itemId) && isOrgMember(incoming().organizationId);
       allow update: if isVerified() && isValidId(itemId) && isValidContentCalendarItem(incoming()) && hasImmutableScopeFields() && (
         isSuperAdmin() ||
         (isOwnerOrAssignedExisting() && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'platform', 'scheduledDate', 'format', 'status', 'notes', 'campaignId', 'updatedAt']))
@@ -549,7 +615,7 @@ service cloud.firestore {
     match /influencer_contacts/{contactId} {
       allow get: if isValidId(contactId) && isOwnerOrAssignedExisting();
       allow list: if canListScopedDoc();
-      allow create: if isVerified() && isValidInfluencerContact(incoming()) && hasValidCreateScope(contactId);
+      allow create: if isVerified() && isValidInfluencerContact(incoming()) && hasValidCreateScope(contactId) && isOrgMember(incoming().organizationId);
       allow update: if isVerified() && isValidId(contactId) && isValidInfluencerContact(incoming()) && hasImmutableScopeFields() && (
         isSuperAdmin() ||
         (isOwnerOrAssignedExisting() && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'handle', 'platform', 'country', 'genreFit', 'sourceType', 'publicContact', 'discussionStatus', 'agreedDeliverables', 'campaignResults', 'outreachDraft', 'updatedAt']))
@@ -560,7 +626,7 @@ service cloud.firestore {
     match /media_contacts/{contactId} {
       allow get: if isValidId(contactId) && isOwnerOrAssignedExisting();
       allow list: if canListScopedDoc();
-      allow create: if isVerified() && isValidMediaContact(incoming()) && hasValidCreateScope(contactId);
+      allow create: if isVerified() && isValidMediaContact(incoming()) && hasValidCreateScope(contactId) && isOrgMember(incoming().organizationId);
       allow update: if isVerified() && isValidId(contactId) && isValidMediaContact(incoming()) && hasImmutableScopeFields() && (
         isSuperAdmin() ||
         (isOwnerOrAssignedExisting() && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'category', 'country', 'location', 'platform', 'publicContact', 'outreachStatus', 'lastContactDate', 'followUpDate', 'notes', 'updatedAt']))
@@ -571,7 +637,7 @@ service cloud.firestore {
     match /playlist_opportunities/{playlistId} {
       allow get: if isValidId(playlistId) && isOwnerOrAssignedExisting();
       allow list: if canListScopedDoc();
-      allow create: if isVerified() && isValidPlaylistOpportunity(incoming()) && hasValidCreateScope(playlistId);
+      allow create: if isVerified() && isValidPlaylistOpportunity(incoming()) && hasValidCreateScope(playlistId) && isOrgMember(incoming().organizationId);
       allow update: if isVerified() && isValidId(playlistId) && isValidPlaylistOpportunity(incoming()) && hasImmutableScopeFields() && (
         isSuperAdmin() ||
         (isOwnerOrAssignedExisting() && incoming().diff(existing()).affectedKeys().hasOnly(['playlistName', 'platform', 'playlistType', 'submissionRequirements', 'submissionLink', 'submissionDate', 'status', 'responseNotes', 'songTitle', 'updatedAt']))
@@ -583,18 +649,19 @@ service cloud.firestore {
       allow get: if isValidId(logId) && isOwnerOrAssignedExisting();
       allow list: if canListScopedDoc();
       allow create: if isVerified() && isValidOutreachHistory(incoming()) && hasValidCreateScope(logId) &&
+                       isOrgMember(incoming().organizationId) &&
                        incoming().userAuthorized == true;
       allow update: if isVerified() && isValidId(logId) && isValidOutreachHistory(incoming()) && hasImmutableScopeFields() && (
         isSuperAdmin() ||
         (isOwnerOrAssignedExisting() && incoming().diff(existing()).affectedKeys().hasOnly(['outcome', 'updatedAt']))
       );
-      allow delete: if isValidId(logId) && isSuperAdmin();
+      allow delete: if false;
     }
 
     match /campaign_metrics/{metricId} {
       allow get: if isValidId(metricId) && isOwnerOrAssignedExisting();
       allow list: if canListScopedDoc();
-      allow create: if isVerified() && isValidCampaignMetric(incoming()) && hasValidCreateScope(metricId);
+      allow create: if isVerified() && isValidCampaignMetric(incoming()) && hasValidCreateScope(metricId) && isOrgMember(incoming().organizationId);
       allow update: if isVerified() && isValidId(metricId) && isValidCampaignMetric(incoming()) && hasImmutableScopeFields() && (
         isSuperAdmin() ||
         (isOwnerOrAssignedExisting() && incoming().diff(existing()).affectedKeys().hasOnly(['reach', 'impressions', 'videoViews', 'engagement', 'shares', 'comments', 'saves', 'linkClicks', 'reportedStreams', 'followersGained', 'adSpend', 'currency', 'recordedDate', 'updatedAt']))
@@ -603,19 +670,19 @@ service cloud.firestore {
     }
 
     match /clients/{clientId} {
-      allow get: if isValidId(clientId) && isOwnerOrAssignedExisting();
+      allow get: if isValidId(clientId) && isPromoterOrAdmin() && isOwnerOrAssignedExisting();
       allow list: if canListScopedDoc();
-      allow create: if isVerified() && isValidClient(incoming()) && hasValidCreateScope(clientId);
-      allow update: if isVerified() && isValidId(clientId) && isValidClient(incoming()) && hasImmutableScopeFields() && (
+      allow create: if isPromoterOrAdmin() && isValidClient(incoming()) && hasValidCreateScope(clientId) && isOrgMember(incoming().organizationId);
+      allow update: if isPromoterOrAdmin() && isValidId(clientId) && isValidClient(incoming()) && hasImmutableScopeFields() && (
         isSuperAdmin() ||
         (isOwnerOrAssignedExisting() && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'email', 'companyOrLabel', 'country', 'packageTier', 'onboardingStatus', 'paymentStatus', 'assignedArtistNames', 'internalNotes', 'communicationHistory', 'assignedUserIds', 'updatedAt']))
       );
-      allow delete: if isValidId(clientId) && isOwnerOrAssignedExisting();
+      allow delete: if isPromoterOrAdmin() && isValidId(clientId) && isOwnerOrAssignedExisting();
     }
 
     match /service_packages/{packageId} {
-      allow get: if isVerified() && isValidId(packageId);
-      allow list: if isVerified() && (isBootstrappedAdmin() || existing().isPublic == true || existing().ownerId == request.auth.uid);
+      allow get: if isVerified() && isValidId(packageId) && (isSuperAdmin() || existing().isPublic == true || existing().ownerId == request.auth.uid);
+      allow list: if isVerified() && (hasAdminListAccess() || existing().isPublic == true || existing().ownerId == request.auth.uid);
       allow create: if isSuperAdmin() && isValidId(packageId) && isValidServicePackage(incoming()) &&
                        incoming().id == packageId &&
                        incoming().ownerId == request.auth.uid &&
@@ -633,29 +700,43 @@ service cloud.firestore {
     match /invoices/{invoiceId} {
       allow get: if isValidId(invoiceId) && isOwnerOrAssignedExisting();
       allow list: if canListScopedDoc();
-      allow create: if isVerified() && isValidInvoice(incoming()) && hasValidCreateScope(invoiceId);
+      allow create: if isVerified() && isValidInvoice(incoming()) && hasValidCreateScope(invoiceId) &&
+                       isOrgMember(incoming().organizationId) &&
+                       incoming().status in ['draft', 'sent'];
       allow update: if isVerified() && isValidId(invoiceId) && isValidInvoice(incoming()) && hasImmutableScopeFields() && (
-        isSuperAdmin() ||
-        (isOwnerOrAssignedExisting() && !(existing().status in ['paid', 'void']) &&
+        (isSuperAdmin() && incoming().amount == existing().amount && incoming().currency == existing().currency) ||
+        (isOwnerOrAssignedExisting() && !(existing().status in ['paid', 'void', 'refunded', 'disputed']) &&
+         incoming().amount == existing().amount &&
+         incoming().currency == existing().currency &&
          incoming().diff(existing()).affectedKeys().hasOnly(['status', 'notes', 'dueDate', 'updatedAt']) &&
-         incoming().status != 'paid')
+         incoming().status in ['draft', 'sent', 'awaiting_verification', 'overdue'])
       );
-      allow delete: if isValidId(invoiceId) && isSuperAdmin();
+      allow delete: if false;
     }
 
     match /payments/{paymentId} {
       allow get: if isValidId(paymentId) && isOwnerOrAssignedExisting();
       allow list: if canListScopedDoc();
       allow create: if isVerified() && isValidPayment(incoming()) && hasValidCreateScope(paymentId) &&
-                       incoming().verificationStatus in ['pending', 'awaiting_provider_integration'];
-      allow update: if isSuperAdmin() && isValidId(paymentId) && isValidPayment(incoming()) && hasImmutableScopeFields();
-      allow delete: if isValidId(paymentId) && isSuperAdmin();
+                       isOrgMember(incoming().organizationId) &&
+                       incoming().verificationStatus in ['pending', 'awaiting_provider_integration'] &&
+                       exists(/databases/$(database)/documents/invoices/$(incoming().invoiceId)) &&
+                       get(/databases/$(database)/documents/invoices/$(incoming().invoiceId)).data.organizationId == incoming().organizationId &&
+                       incoming().amount == get(/databases/$(database)/documents/invoices/$(incoming().invoiceId)).data.amount &&
+                       incoming().currency == get(/databases/$(database)/documents/invoices/$(incoming().invoiceId)).data.currency;
+      allow update: if isSuperAdmin() && isValidId(paymentId) && isValidPayment(incoming()) && hasImmutableScopeFields() &&
+                       incoming().invoiceId == existing().invoiceId &&
+                       incoming().provider == existing().provider &&
+                       incoming().reference == existing().reference &&
+                       incoming().amount == existing().amount &&
+                       incoming().currency == existing().currency;
+      allow delete: if false;
     }
 
     match /notifications/{notificationId} {
       allow get: if isValidId(notificationId) && isOwnerOrAssignedExisting();
       allow list: if canListScopedDoc();
-      allow create: if isVerified() && isValidNotification(incoming()) && hasValidCreateScope(notificationId);
+      allow create: if isVerified() && isValidNotification(incoming()) && hasValidCreateScope(notificationId) && isOrgMember(incoming().organizationId);
       allow update: if isVerified() && isValidId(notificationId) && isValidNotification(incoming()) && hasImmutableScopeFields() && (
         isSuperAdmin() ||
         (isOwnerOrAssignedExisting() && incoming().diff(existing()).affectedKeys().hasOnly(['read', 'updatedAt']))
@@ -666,21 +747,30 @@ service cloud.firestore {
     match /ai_usage_logs/{logId} {
       allow get: if isValidId(logId) && isOwnerOrAssignedExisting();
       allow list: if canListScopedDoc();
-      allow create: if isVerified() && isValidAiUsageLog(incoming()) && hasValidCreateScope(logId);
+      allow create: if isVerified() && isValidAiUsageLog(incoming()) && hasValidCreateScope(logId) && isOrgMember(incoming().organizationId);
       allow update: if false;
-      allow delete: if isSuperAdmin() && isValidId(logId);
+      allow delete: if false;
     }
 
     match /ad_plans/{planId} {
       allow get: if isValidId(planId) && isOwnerOrAssignedExisting();
       allow list: if canListScopedDoc();
       allow create: if isVerified() && isValidAdPlan(incoming()) && hasValidCreateScope(planId) &&
+                       isOrgMember(incoming().organizationId) &&
                        incoming().apiExecutionState in ['manual_plan_only', 'awaiting_api_integration'];
       allow update: if isVerified() && isValidId(planId) && isValidAdPlan(incoming()) && hasImmutableScopeFields() && (
         isSuperAdmin() ||
         (isOwnerOrAssignedExisting() && incoming().diff(existing()).affectedKeys().hasOnly(['objective', 'audienceDefinition', 'geoTargeting', 'currency', 'budget', 'durationDays', 'creativeRecommendations', 'adCopy', 'humanConfirmed', 'apiExecutionState', 'updatedAt']))
       );
       allow delete: if isValidId(planId) && isOwnerOrAssignedExisting();
+    }
+
+    match /admin_audit_logs/{logId} {
+      allow get: if isSuperAdmin() && isValidId(logId);
+      allow list: if isVerified() && hasAdminListAccess();
+      allow create: if isSuperAdmin() && isValidAdminAuditLog(incoming()) && hasValidCreateScope(logId);
+      allow update: if false;
+      allow delete: if false;
     }
   }
 }

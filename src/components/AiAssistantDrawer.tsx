@@ -21,14 +21,12 @@ const STARTER_QUESTIONS = [
 
 export const AiAssistantDrawer: React.FC = () => {
   const {
+    user,
     assistantOpen,
     setAssistantOpen,
     artists,
     songs,
     campaigns,
-    metrics,
-    tasks,
-    currency,
     logAiUsage,
   } = useWorkspace();
 
@@ -36,7 +34,7 @@ export const AiAssistantDrawer: React.FC = () => {
     {
       role: 'assistant',
       content:
-        'I am the SONICPUSH AI Strategist—connected to your live artists, songs, campaigns, and logged metrics. Ask for Nigerian, African, or international music marketing strategies grounded strictly in your saved data.',
+        'I am the SONICPUSH AI Strategist—connected via server-verified Firestore queries to your live artists, songs, campaigns, and logged metrics. Ask for Nigerian, African, or international music marketing strategies.',
     },
   ]);
   const [input, setInput] = useState('');
@@ -54,47 +52,15 @@ export const AiAssistantDrawer: React.FC = () => {
     setLoading(true);
 
     try {
-      const workspaceContext = {
-        currency,
-        artists: artists.slice(0, 15).map((a) => ({
-          name: a.name,
-          country: a.country,
-          city: a.city,
-          genre: a.genre,
-          careerStage: a.careerStage,
-          objectives: a.marketingObjectives,
-        })),
-        songs: songs.slice(0, 15).map((s) => ({
-          title: s.title,
-          artistName: s.artistName,
-          genre: s.genre,
-          language: s.language,
-          releaseDate: s.releaseDate,
-          audioProcessed: s.audioProcessed,
-          message: s.message,
-        })),
-        campaigns: campaigns.slice(0, 10).map((c) => ({
-          name: c.name,
-          artistName: c.artistName,
-          type: c.campaignType,
-          durationDays: c.durationDays,
-          currency: c.currency,
-          budget: c.budget,
-          status: c.status,
-          targetMarkets: c.targetMarkets,
-        })),
-        metricsSummaryCount: metrics.length,
-        recentMetrics: metrics.slice(0, 20),
-        openTasks: tasks.filter((t) => t.status !== 'done').slice(0, 15),
-      };
-
-      const res = await postJsonApi<{ reply: string; latencyMs: number; model: string }>(
-        '/api/ai/assistant',
-        {
-          messages: nextMessages,
-          workspaceContext,
-        }
-      );
+      const res = await postJsonApi<{
+        reply: string;
+        latencyMs: number;
+        model: string;
+        contextRecordCounts?: { artists: number; songs: number; campaigns: number };
+      }>('/api/ai/assistant', {
+        messages: nextMessages,
+        organizationId: user.organizationId,
+      });
 
       void logAiUsage('ai_assistant', res.model || 'gemini-4-hydrogen', 'success', res.latencyMs || 0);
       setMessages([...nextMessages, { role: 'assistant', content: res.reply }]);
@@ -106,7 +72,7 @@ export const AiAssistantDrawer: React.FC = () => {
           role: 'assistant',
           content:
             err instanceof Error
-              ? `Unable to reach SONICPUSH AI: ${err.message}`
+              ? `Unable to process request: ${err.message}`
               : 'Unable to process request right now.',
         },
       ]);
@@ -124,7 +90,7 @@ export const AiAssistantDrawer: React.FC = () => {
             <div>
               <h2 className="font-display text-sm font-bold text-white">SONICPUSH AI Strategist</h2>
               <p className="text-[11px] text-zinc-400">
-                Grounded in {artists.length} artists · {songs.length} songs · {campaigns.length} campaigns
+                Server-verified context: {artists.length} artists · {songs.length} songs · {campaigns.length} campaigns
               </p>
             </div>
           </div>

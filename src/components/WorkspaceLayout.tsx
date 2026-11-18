@@ -69,6 +69,7 @@ const NAV_ITEMS: NavItem[] = [
 export const WorkspaceLayout: React.FC<{ onSignOut: () => Promise<void> }> = ({ onSignOut }) => {
   const {
     user,
+    isSuperAdmin,
     currency,
     setCurrency,
     activeSection,
@@ -82,11 +83,20 @@ export const WorkspaceLayout: React.FC<{ onSignOut: () => Promise<void> }> = ({ 
 
   const visibleNav = NAV_ITEMS.filter(
     (item) => !item.roles || item.roles.includes(user.role)
+  ).map((item) =>
+    item.id === 'clients' && user.role === 'ARTIST'
+      ? { ...item, label: 'Service Packages' }
+      : item
   );
   const unreadCount = notifications.filter((n) => !n.read).length;
   const activeNavMeta = visibleNav.find((n) => n.id === activeSection);
 
   const handleSelectSection = (id: WorkspaceSection) => {
+    if (id === 'admin' && !isSuperAdmin) {
+      setActiveSection('dashboard');
+      setMobileNavOpen(false);
+      return;
+    }
     setActiveSection(id);
     setMobileNavOpen(false);
   };
@@ -122,7 +132,7 @@ export const WorkspaceLayout: React.FC<{ onSignOut: () => Promise<void> }> = ({ 
       case 'notifications':
         return <NotificationsView />;
       case 'admin':
-        return <PaymentsAdminView initialTab="admin" />;
+        return isSuperAdmin ? <PaymentsAdminView initialTab="admin" /> : <DashboardView />;
       default:
         return <DashboardView />;
     }

@@ -44,10 +44,27 @@ SONICPUSH AI is a full-stack AI-powered music promotion agency and artist manage
    npm start
    ```
 
-5. **Lint Firestore security rules**
+5. **Lint & Test Security Hardening**
    ```bash
    npx eslint firestore.rules
+   npm test
+   # With Java 17+ installed locally for Firebase Emulator:
+   firebase emulators:exec --only firestore "npm run test:rules"
    ```
+
+---
+
+## Security & Payment Architecture (Phase 1 Hardened)
+
+- **Server-Verified Sessions & RBAC**: `GET /api/auth/session` and `POST /api/auth/onboarding-check` validate Firebase ID tokens server-side and enforce `SUPER_ADMIN` privileges without client-side email allowlists. Role updates go through `POST /api/admin/users/:targetUid/role` with `admin_audit_logs` tracking.
+- **Starter Tier Architecture**: Designed for AI Studio Starter Tier projects (no IAM service-account admin privilege); Firestore REST calls execute under the caller's verified Firebase ID token so `firestore.rules` always enforces strict tenant isolation.
+- **Fail-Closed Payment Verification & Raw-Body Webhooks**:
+  - `POST /api/payments/verify` fetches authoritative invoice amounts and organization ownership directly from Firestore on the server, compares minor units (`toMinorUnits`), enforces reference uniqueness across invoices and organizations, and supports Paystack, Flutterwave, and Stripe (`stripe` SDK).
+  - `POST /api/payments/webhook/:provider` preserves the raw request buffer (`req.rawBody`), verifies official Paystack (`x-paystack-signature` HMAC-SHA512), Flutterwave (`verif-hash` / `flutterwave-signature`), and Stripe (`stripe.webhooks.constructEvent`) signatures, deduplicates events for idempotency, and handles `failed`, `refunded`, and `disputed` transitions.
+- **Gemini AI & Audio Upload Security**:
+  - Every `/api/ai/*` endpoint requires verified Firebase Auth, per-user rate/daily quotas (`SlidingWindowQuotaLimiter`), strict input sanitization, and prompt-injection delimiters.
+  - `/api/ai/assistant` retrieves workspace records server-side from Firestore instead of trusting browser-submitted context.
+  - Song Intelligence validates audio binary signatures (magic bytes beyond extension/MIME) up to 20 MB, assigns UUID private storage paths (`storage.rules`), attaches retention metadata (`AUDIO_RETENTION_DAYS`), and cleans up Storage objects on deletion. Automated antivirus scanning is not performed.
 
 ---
 
@@ -57,7 +74,10 @@ SONICPUSH AI is a full-stack AI-powered music promotion agency and artist manage
 2. Ensure `NODE_ENV=production` and `GEMINI_API_KEY` are configured in Cloud Run environment variables / Secret Manager.
 3. Cloud Run executes `npm start` (`node server.ts`), listening on `0.0.0.0:$PORT`.
 4. Add your Cloud Run domain to **Firebase Console → Authentication → Settings → Authorized domains** so Google Sign-In works in production.
-5. Review and audit `firestore.rules` before opening access broadly.
+5. Deploy updated security rules manually after review:
+   ```bash
+   firebase deploy --only firestore:rules,storage
+   ```
 
 ---
 
@@ -65,7 +85,7 @@ SONICPUSH AI is a full-stack AI-powered music promotion agency and artist manage
 
 Per platform honesty and compliance guardrails, no metrics, payments, outreach dispatches, or ad spends are ever simulated:
 
-1. **Payment Gateways**: Live `PAYSTACK_SECRET_KEY`, `FLUTTERWAVE_SECRET_HASH`, and `STRIPE_WEBHOOK_SECRET` merchant credentials (server verification and webhook signature scaffolding exist in `/api/payments/verify` and `/api/payments/webhook/:provider`, returning `awaiting_provider_integration` until keys are configured).
+1. **Payment Gateways**: Live `PAYSTACK_SECRET_KEY`, `FLUTTERWAVE_SECRET_KEY`, `FLUTTERWAVE_SECRET_HASH`, `STRIPE_SECRET_KEY`, and `STRIPE_WEBHOOK_SECRET` merchant credentials (server verification and webhook signature validation return `awaiting_provider_integration` until keys are configured).
 2. **Advertising Platform APIs**: Meta Marketing API, TikTok Marketing API, and YouTube Ads API credentials for automated campaign telemetry sync (currently supports manual & CSV metric logging with `manual` vs `api` source tracking).
 3. **Automated Messaging Dispatch**: WhatsApp Business API / SMTP / SendGrid credentials for automated outreach delivery (currently generates drafts and logs explicitly authorized manual outreach).
 4. **Streaming Platform Analytics APIs**: Spotify for Artists, Apple Music for Artists, and Audiomack creator APIs for automated stream ingestion.

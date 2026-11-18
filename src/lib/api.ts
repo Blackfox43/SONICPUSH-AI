@@ -11,6 +11,22 @@ async function getAuthHeaders(): Promise<Record<string, string>> {
   };
 }
 
+export async function getJsonApi<TResponse>(url: string): Promise<TResponse> {
+  const authHeaders = await getAuthHeaders();
+  const res = await fetch(url, {
+    method: 'GET',
+    headers: {
+      ...authHeaders,
+    },
+  });
+
+  const data = (await res.json()) as TResponse & { error?: string };
+  if (!res.ok) {
+    throw new Error(data.error || `Request failed with status ${res.status}`);
+  }
+  return data;
+}
+
 export async function postJsonApi<TResponse>(
   url: string,
   body: Record<string, unknown>

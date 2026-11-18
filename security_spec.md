@@ -1,24 +1,24 @@
-# SONICPUSH AI — Firestore Security Specification
+# SONICPUSH AI — Firestore Security Specification (Phase 1 Hardened)
 
 ## 1. Data Invariants
 1. **Verified Identity**: All database writes and reads require `request.auth != null` and `request.auth.token.email_verified == true` (except `test/connection` health probe).
-2. **No Self-Escalation**: A user creating `users/{uid}` may only choose `ARTIST` or `PROMOTER`. Only the bootstrapped admin email or an existing `SUPER_ADMIN` can hold or grant `SUPER_ADMIN`.
-3. **Immutable Ownership & Tenant Scope**: `ownerId`, `organizationId`, and `createdAt` cannot be modified after creation.
-4. **Server Timestamps**: `createdAt == request.time` on creation and `updatedAt == request.time` on updates.
-5. **Organization & Assignment Isolation**: `list` queries never delegate filtering to the client; rules enforce `resource.data.ownerId == request.auth.uid || request.auth.uid in resource.data.assignedUserIds || isBootstrappedAdmin()`.
-6. **Terminal State Locking**: Paid/void invoices, verified payments, and completed campaigns cannot be mutated by non-admins once in terminal state.
-7. **PII Isolation**: User records with email PII can only be read by the owner or `SUPER_ADMIN`.
+2. **No Self-Escalation & Custom Claim Governance**: A user creating `users/{uid}` may only choose `ARTIST` or `PROMOTER` unless holding a verified `superAdmin == true` custom claim or matching the bootstrap owner account. Only an existing `SUPER_ADMIN` can grant or revoke roles, and the bootstrap owner cannot be deleted or locked out.
+3. **Organization Membership Gate**: Every tenant-scoped document creation validates that `incoming().organizationId` exists in `/organizations/{orgId}` and `request.auth.uid` is the org owner or in `assignedUserIds`.
+4. **Immutable Ownership & Tenant Scope**: `ownerId`, `organizationId`, and `createdAt` cannot be modified after creation, and `ownerId` must always remain in `assignedUserIds`.
+5. **Server Timestamps**: `createdAt == request.time` on creation and `updatedAt == request.time` on updates.
+6. **Organization & Assignment Isolation**: `list` queries never delegate filtering to the client; rules enforce `resource.data.ownerId == request.auth.uid || request.auth.uid in resource.data.assignedUserIds || hasAdminPrivilege()`.
+7. **Financial & Audit Immutability**:
+   - `payments` must reference an existing `invoice` in the same `organizationId` with matching `amount` and `currency`, and clients can only create `pending` or `awaiting_provider_integration` states (never `verified`, `refunded`, or `disputed`).
+   - Paid, void, refunded, or disputed invoices cannot be modified by non-admins; non-admins can never change `amount`/`currency` on issued invoices or set `status == 'paid'`.
+   - `payments`, `invoices`, `ai_usage_logs`, `outreach_history`, and `admin_audit_logs` have `allow delete: if false` so financial and audit trails cannot be erased.
+8. **Role Boundaries & Private Catalogs**: Only `PROMOTER` or `SUPER_ADMIN` can create/modify/delete agency `clients`. Only `SUPER_ADMIN` can create/modify/delete `service_packages`, and non-public packages (`isPublic == false`) cannot be read by non-admins.
 
-## 2. The "Dirty Dozen" Adversarial Payloads
-1. **Role Self-Escalation on Create**: Creating `/users/attackerUid` with `role: "SUPER_ADMIN"` as a non-admin email -> `PERMISSION_DENIED`.
-2. **Role Self-Escalation on Update**: Updating own `/users/uid` changing `role` from `"ARTIST"` to `"PROMOTER"` or `"SUPER_ADMIN"` -> `PERMISSION_DENIED`.
-3. **Cross-Tenant Org Spoofing**: Creating `/artists/a1` with `organizationId` belonging to another org or omitting `ownerId == request.auth.uid` -> `PERMISSION_DENIED`.
-4. **Shadow Field Injection**: Updating `/campaigns/c1` with an extra undeclared field `isFeatured: true` -> `PERMISSION_DENIED` (`hasOnly` + `isValidCampaign`).
-5. **Unverified Email Spoof**: Request with `email_verified: false` claiming admin email -> `PERMISSION_DENIED`.
-6. **Blanket List Scraping**: Listing `/artists` or `/clients` without matching `ownerId`/`assignedUserIds` -> `PERMISSION_DENIED`.
-7. **ID Poisoning**: Creating `/songs/../../etc/passwd` or 200-char ID -> `PERMISSION_DENIED` (`isValidId`).
-8. **Timestamp Forgery**: Creating `/campaigns/c1` with backdated `createdAt` != `request.time` -> `PERMISSION_DENIED`.
-9. **Terminal Invoice Tampering**: Non-admin modifying `amount` on an invoice with `status: "paid"` -> `PERMISSION_DENIED`.
-10. **Payment Verification Forgery**: Non-admin updating `/payments/p1` setting `verificationStatus: "verified"` -> `PERMISSION_DENIED`.
-11. **Service Package Price Tampering**: Artist/Promoter updating `/service_packages/STARTER` -> `PERMISSION_DENIED`.
-12. **PII Blanket Read**: Authenticated User A reading `/users/userB` -> `PERMISSION_DENIED`.
+## 2. Adversarial Security Test Vectors
+1. **Anonymous Access**: Unauthenticated read/write on any user/tenant collection -> `PERMISSION_DENIED`.
+2. **Normal Artist Access**: Artist reads/writes own artist/song/campaign inside own org; denied from modifying `clients` or `service_packages` -> `ALLOWED` for own scope, `PERMISSION_DENIED` for agency/admin scopes.
+3. **Promoter Access**: Promoter manages own agency workspace (`artists`, `clients`, `campaigns`), denied from `service_packages` or another agency's docs -> `PERMISSION_DENIED` cross-scope.
+4. **Organization Isolation**: User A in Org A attempting to read/update Org B document OR create a document tagged `organizationId: orgB` -> `PERMISSION_DENIED` (`isOrgMember`).
+5. **Unauthorized Role Escalation**: Creating `/users/attackerUid` with `role: "SUPER_ADMIN"`, updating own `/users/uid` changing `role` to `"SUPER_ADMIN"` or `"PROMOTER"`, or injecting `organizationId` -> `PERMISSION_DENIED`.
+6. **Unauthorized Payment Updates**: Non-admin creating `/payments/p1` with `verificationStatus: "verified"`, mismatched invoice amount/currency, cross-org `invoiceId`, updating any payment, or deleting a payment -> `PERMISSION_DENIED`.
+7. **Unauthorized Invoice Modification**: Non-admin updating `/invoices/inv1` to `status: "paid"`, changing `amount`/`currency`, mutating a `paid`/`void` invoice, or deleting an invoice -> `PERMISSION_DENIED`.
+8. **Authorized Administrator Operations**: Bootstrap Super Admin and promoted Super Admin (`superAdmin` claim / role) can govern users, configure `service_packages`, reconcile verified payments/invoices, and write `admin_audit_logs` -> `ALLOWED`.

@@ -1,0 +1,43 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Default deny all public and unauthenticated storage access
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+
+    // Private organization-scoped audio assets only (never public by default)
+    match /organizations/{orgId}/audio/{fileName} {
+      allow read: if request.auth != null &&
+                     request.auth.token.email_verified == true &&
+                     orgId.matches('^[a-zA-Z0-9_\\-]+$') &&
+                     fileName.matches('^[a-zA-Z0-9._\\-]+$') &&
+                     (
+                       (resource != null && resource.metadata != null && resource.metadata.ownerId == request.auth.uid && resource.metadata.organizationId == orgId) ||
+                       request.auth.token.superAdmin == true ||
+                       request.auth.token.email == 'emma432cent@gmail.com'
+                     );
+
+      allow create: if request.auth != null &&
+                       request.auth.token.email_verified == true &&
+                       orgId.matches('^[a-zA-Z0-9_\\-]+$') &&
+                       fileName.matches('^[a-fA-F0-9\\-]+\\.(mp3|wav|m4a|aac|ogg|flac|webm)$') &&
+                       request.resource != null &&
+                       request.resource.size > 0 &&
+                       request.resource.size <= 20 * 1024 * 1024 &&
+                       request.resource.contentType.matches('audio/.*') &&
+                       request.resource.metadata != null &&
+                       request.resource.metadata.ownerId == request.auth.uid &&
+                       request.resource.metadata.organizationId == orgId;
+
+      allow delete: if request.auth != null &&
+                       request.auth.token.email_verified == true &&
+                       (
+                         (resource != null && resource.metadata != null && resource.metadata.ownerId == request.auth.uid) ||
+                         request.auth.token.superAdmin == true ||
+                         request.auth.token.email == 'emma432cent@gmail.com'
+                       );
+    }
+  }
+}

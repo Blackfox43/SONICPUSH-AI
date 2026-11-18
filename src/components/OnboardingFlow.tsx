@@ -1,7 +1,8 @@
 import React, { useState } from 'react';
 import { doc, serverTimestamp, writeBatch } from 'firebase/firestore';
 import { ArrowRight, LogOut } from 'lucide-react';
-import { BOOTSTRAPPED_ADMIN_EMAIL, db, makeDocId, clampStr, handleFirestoreError, OperationType } from '../lib/firebase';
+import { db, makeDocId, clampStr, handleFirestoreError, OperationType } from '../lib/firebase';
+import { postJsonApi } from '../lib/api';
 import { BrandMark } from './BrandMark';
 import type { CurrencyCode, UserProfile, UserRole } from '../types/sonicpush';
 
@@ -10,6 +11,7 @@ interface OnboardingFlowProps {
   email: string;
   displayName: string;
   photoURL?: string;
+  serverCanSuperAdmin?: boolean;
   onComplete: (profile: UserProfile) => void;
   onSignOut: () => Promise<void>;
 }
@@ -19,10 +21,11 @@ export const OnboardingFlow: React.FC<OnboardingFlowProps> = ({
   email,
   displayName,
   photoURL,
+  serverCanSuperAdmin = false,
   onComplete,
   onSignOut,
 }) => {
-  const isAdminEmail = email.toLowerCase() === BOOTSTRAPPED_ADMIN_EMAIL.toLowerCase();
+  const isAdminEmail = serverCanSuperAdmin;
   const [role, setRole] = useState<UserRole>(isAdminEmail ? 'SUPER_ADMIN' : 'PROMOTER');
   const [nameInput, setNameInput] = useState(displayName || email.split('@')[0] || 'Artist');
   const [orgName, setOrgName] = useState(
@@ -60,6 +63,12 @@ export const OnboardingFlow: React.FC<OnboardingFlowProps> = ({
 
     setSubmitting(true);
     try {
+      const roleCheck = await postJsonApi<{ approvedRole: UserRole; isSuperAdmin: boolean }>(
+        '/api/auth/onboarding-check',
+        { role }
+      );
+      const effectiveRole = roleCheck.approvedRole;
+
       const orgId = makeDocId('org');
       const batch = writeBatch(db);
 
@@ -81,7 +90,7 @@ export const OnboardingFlow: React.FC<OnboardingFlowProps> = ({
         email: clampStr(email, 254),
         displayName: clampStr(nameInput, 120),
         ...(photoURL ? { photoURL: clampStr(photoURL, 1024) } : {}),
-        role,
+        role: effectiveRole,
         organizationId: orgId,
         preferredCurrency: currency,
         onboardingCompleted: true,
@@ -93,7 +102,7 @@ export const OnboardingFlow: React.FC<OnboardingFlowProps> = ({
       batch.set(doc(db, 'users', firebaseUid), userPayload);
 
       // Bootstrap default unpriced service packages for Super Admin on first setup
-      if (role === 'SUPER_ADMIN') {
+      if (effectiveRole === 'SUPER_ADMIN') {
         const defaultTiers: Array<{
           tier: 'STARTER' | 'GROWTH' | 'PREMIUM' | 'ELITE' | 'CUSTOM CAMPAIGN';
           title: string;
@@ -164,7 +173,7 @@ export const OnboardingFlow: React.FC<OnboardingFlowProps> = ({
         email,
         displayName: clampStr(nameInput, 120),
         photoURL,
-        role,
+        role: effectiveRole,
         organizationId: orgId,
         preferredCurrency: currency,
         onboardingCompleted: true,
