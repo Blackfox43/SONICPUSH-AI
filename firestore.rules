@@ -816,5 +816,13 @@ service cloud.firestore {
       allow update: if false;
       allow delete: if false;
     }
+
+    match /audio_cleanup_cursors/{cursorId} {
+      allow get: if isSuperAdmin() && isValidId(cursorId);
+      allow list: if isVerified() && hasAdminListAccess();
+      allow create: if false;
+      allow update: if false;
+      allow delete: if false;
+    }
   }
 }

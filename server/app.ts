@@ -33,6 +33,7 @@ import {
 import {
   AudioRetentionService,
   createFirebaseAdminAudioStorage,
+  makeCleanupQueueDocId,
   parseAudioOrgFromPath,
   type AudioStorageAdapter,
 } from './audioStorage.ts';
@@ -554,10 +555,29 @@ export function createSonicPushApp(deps: SonicPushAppDeps = {}): Express {
           ? req.body.orphanGraceMinutes
           : undefined;
       const organizationId = sanitizeTextField(req.body?.organizationId, 128) || undefined;
+      const orphanPageSize =
+        typeof req.body?.orphanPageSize === 'number' && Number.isFinite(req.body.orphanPageSize)
+          ? req.body.orphanPageSize
+          : undefined;
+      const orphanMaxPagesPerRun =
+        typeof req.body?.orphanMaxPagesPerRun === 'number' &&
+        Number.isFinite(req.body.orphanMaxPagesPerRun)
+          ? req.body.orphanMaxPagesPerRun
+          : undefined;
+      const orphanMaxObjectsPerRun =
+        typeof req.body?.orphanMaxObjectsPerRun === 'number' &&
+        Number.isFinite(req.body.orphanMaxObjectsPerRun)
+          ? req.body.orphanMaxObjectsPerRun
+          : undefined;
+      const resetOrphanCursor = req.body?.resetOrphanCursor === true;
       const summary = await audioRetention.cleanupExpiredAudio({
         limit,
         includeOrphans,
         orphanGraceMinutes,
+        orphanPageSize,
+        orphanMaxPagesPerRun,
+        orphanMaxObjectsPerRun,
+        resetOrphanCursor,
         organizationId,
       });
       res.json(summary);
@@ -1011,9 +1031,27 @@ CRITICAL HONESTY & GROUNDING RULES:
         }
 
         const songOrg = typeof song.organizationId === 'string' ? song.organizationId : '';
-        const storagePath = typeof song.audioStoragePath === 'string' ? song.audioStoragePath : '';
+        if (
+          !session.isSuperAdmin &&
+          session.organizationId &&
+          songOrg &&
+          session.organizationId !== songOrg
+        ) {
+          res.status(403).json({
+            ok: false,
+            deleted: false,
+            error: 'Cross-organization song deletion blocked.',
+          });
+          return;
+        }
 
-        if (storagePath && song.audioStorageCleanupStatus !== 'deleted') {
+        const storagePath = typeof song.audioStoragePath === 'string' ? song.audioStoragePath : '';
+        const hasActiveStorageObject = Boolean(
+          storagePath && song.audioStorageCleanupStatus !== 'deleted'
+        );
+        let storageDeleted = false;
+
+        if (hasActiveStorageObject) {
           const pathOrg = parseAudioOrgFromPath(storagePath);
           if (!pathOrg || !songOrg || pathOrg !== songOrg) {
             logStructured('warn', 'song_delete_cross_org_path_blocked', {
@@ -1029,8 +1067,26 @@ CRITICAL HONESTY & GROUNDING RULES:
             return;
           }
 
+          if (audioStorage.getAudioMetadata) {
+            const objMeta = await audioStorage.getAudioMetadata(storagePath).catch(() => null);
+            if (objMeta?.organizationId && objMeta.organizationId !== songOrg) {
+              logStructured('warn', 'song_delete_cross_org_metadata_blocked', {
+                songId,
+                songOrg,
+                metadataOrg: objMeta.organizationId,
+              });
+              res.status(403).json({
+                ok: false,
+                deleted: false,
+                error: 'Cross-organization storage deletion blocked due to object metadata mismatch.',
+              });
+              return;
+            }
+          }
+
           try {
             await audioStorage.deleteAudioObject(storagePath);
+            storageDeleted = true;
           } catch (storageErr) {
             const safeErr = sanitizeErrorMessage(
               storageErr,
@@ -1044,34 +1100,106 @@ CRITICAL HONESTY & GROUNDING RULES:
               })
               .catch(() => null);
 
-            await audioRetention
-              .enqueueCleanupTask({
+            let cleanupQueued = false;
+            try {
+              await audioRetention.enqueueCleanupTask({
                 storageObjectPath: storagePath,
                 organizationId: songOrg,
                 songId,
                 deleteSongOnCleanup: true,
+                storageDeleted: false,
                 reason: 'song_delete_failed',
                 error: storageErr,
-              })
-              .catch(() => null);
+              });
+              cleanupQueued = true;
+            } catch {
+              cleanupQueued = false;
+            }
 
             logStructured('error', 'song_delete_storage_failed_preserved_db', {
               songId,
               orgId: songOrg,
+              cleanupQueued,
               error: safeErr,
             });
 
             res.status(502).json({
               ok: false,
               deleted: false,
-              cleanupQueued: true,
+              cleanupPending: true,
+              cleanupQueued,
+              storageDeleted: false,
               songId,
               error:
                 'Private audio deletion failed in Storage. Database metadata was preserved and cleanup retry has been queued.',
             });
             return;
           }
+        }
 
+        try {
+          await adminDb.deleteDoc('songs', songId);
+        } catch (dbErr) {
+          const safeDbErr = sanitizeErrorMessage(
+            dbErr,
+            'Failed to delete song record in Firestore.'
+          );
+          const effectiveSongOrg = songOrg || session.organizationId || '';
+          const queuePath =
+            storagePath ||
+            (effectiveSongOrg
+              ? `organizations/${effectiveSongOrg}/audio/metadata-only-${songId}`
+              : '');
+
+          await adminDb
+            .updateDoc('songs', songId, {
+              ...(storageDeleted ? { audioStorageCleanupStatus: 'deleted' } : {}),
+              audioCleanupError: safeDbErr.slice(0, 380),
+              updatedAt: SERVER_TIMESTAMP_SENTINEL,
+            })
+            .catch(() => null);
+
+          let cleanupQueued = false;
+          if (queuePath && effectiveSongOrg) {
+            try {
+              await audioRetention.enqueueCleanupTask({
+                storageObjectPath: queuePath,
+                organizationId: effectiveSongOrg,
+                songId,
+                deleteSongOnCleanup: true,
+                storageDeleted: true,
+                reason: 'song_delete_failed',
+                error: dbErr,
+              });
+              cleanupQueued = true;
+            } catch {
+              cleanupQueued = false;
+            }
+          }
+
+          logStructured('error', 'song_delete_firestore_failed_cleanup_pending', {
+            songId,
+            orgId: effectiveSongOrg,
+            storageDeleted,
+            cleanupQueued,
+            error: safeDbErr,
+          });
+
+          res.status(502).json({
+            ok: false,
+            deleted: false,
+            cleanupPending: true,
+            cleanupQueued,
+            storageDeleted,
+            songId,
+            error: cleanupQueued
+              ? 'Storage deletion succeeded, but Firestore song deletion failed. Cleanup is pending and a durable retry task has been queued.'
+              : 'Storage deletion succeeded, but Firestore song deletion failed and cleanup queuing also failed.',
+          });
+          return;
+        }
+
+        if (storageDeleted && storagePath) {
           await audioRetention.logCleanupAttempt({
             songId,
             organizationId: songOrg,
@@ -1079,9 +1207,11 @@ CRITICAL HONESTY & GROUNDING RULES:
             status: 'deleted',
             reason: 'song_delete_failed',
           });
+          await adminDb
+            .deleteDoc('audio_cleanup_queue', makeCleanupQueueDocId(storagePath))
+            .catch(() => null);
         }
 
-        await adminDb.deleteDoc('songs', songId);
         res.json({ ok: true, deleted: true, songId });
       } catch (err) {
         res.status(500).json({

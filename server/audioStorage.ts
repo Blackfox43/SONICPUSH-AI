@@ -23,12 +23,30 @@ export interface AudioStorageObjectSummary {
   updatedAt?: string;
 }
 
+export interface AudioStoragePageRequest {
+  prefix?: string;
+  pageToken?: string;
+  maxResults?: number;
+}
+
+export interface AudioStoragePageResult {
+  objects: AudioStorageObjectSummary[];
+  nextPageToken?: string;
+}
+
+export interface AudioObjectMetadata {
+  organizationId?: string;
+  ownerId?: string;
+}
+
 export interface AudioStorageAdapter {
   uploadPrivateAudio(params: AudioUploadParams): Promise<void>;
   deleteAudioObject(storageObjectPath: string): Promise<void>;
   getSignedReadUrl?(storageObjectPath: string, expiresInSeconds?: number): Promise<string>;
   readAudioStream?(storageObjectPath: string): Promise<{ buffer: Buffer; contentType?: string }>;
+  getAudioMetadata?(storageObjectPath: string): Promise<AudioObjectMetadata | null>;
   listAudioObjects?(prefix?: string): Promise<AudioStorageObjectSummary[]>;
+  listAudioObjectsPage?(params: AudioStoragePageRequest): Promise<AudioStoragePageResult>;
 }
 
 export type AudioCleanupReason =
@@ -43,6 +61,7 @@ export interface AudioCleanupQueueItem {
   organizationId: string;
   songId?: string;
   deleteSongOnCleanup?: boolean;
+  storageDeleted?: boolean;
   reason: AudioCleanupReason;
   status: 'pending' | 'failed';
   retryCount: number;
@@ -56,13 +75,43 @@ export function makeCleanupQueueDocId(storageObjectPath: string): string {
   return `acleanq_${hash}`;
 }
 
+export function makeOrphanCursorDocId(organizationId?: string): string {
+  if (!organizationId) {
+    return 'orphan_cursor_all';
+  }
+  const hash = crypto.createHash('sha256').update(organizationId).digest('hex').slice(0, 24);
+  return `orphan_cursor_org_${hash}`;
+}
+
 export function parseAudioOrgFromPath(storageObjectPath: string): string | null {
   const match = /^organizations\/([a-zA-Z0-9_-]+)\/audio\/[a-zA-Z0-9._-]+$/.exec(storageObjectPath);
   return match ? match[1] : null;
 }
 
-export function createFirebaseAdminAudioStorage(): AudioStorageAdapter {
+function mapStorageFileSummary(file: {
+  name: string;
+  metadata?: Record<string, unknown>;
+}): AudioStorageObjectSummary {
+  const meta = file.metadata || {};
+  const customMeta = (meta.metadata || {}) as Record<string, unknown>;
   return {
+    path: file.name,
+    organizationId:
+      typeof customMeta.organizationId === 'string' && customMeta.organizationId.trim()
+        ? customMeta.organizationId.trim()
+        : undefined,
+    uploadedAt:
+      typeof customMeta.uploadedAt === 'string'
+        ? customMeta.uploadedAt
+        : typeof meta.timeCreated === 'string'
+        ? meta.timeCreated
+        : undefined,
+    updatedAt: typeof meta.updated === 'string' ? meta.updated : undefined,
+  };
+}
+
+export function createFirebaseAdminAudioStorage(): AudioStorageAdapter {
+  const adapter: AudioStorageAdapter = {
     async uploadPrivateAudio(params: AudioUploadParams): Promise<void> {
       const bucket = getAdminStorageBucket();
       const file = bucket.file(params.storageObjectPath);
@@ -119,34 +168,82 @@ export function createFirebaseAdminAudioStorage(): AudioStorageAdapter {
       };
     },
 
-    async listAudioObjects(prefix = 'organizations/'): Promise<AudioStorageObjectSummary[]> {
+    async getAudioMetadata(storageObjectPath: string): Promise<AudioObjectMetadata | null> {
       const bucket = getAdminStorageBucket();
-      const [files] = await bucket.getFiles({
+      const file = bucket.file(storageObjectPath);
+      try {
+        const [meta] = await file.getMetadata();
+        const customMeta = ((meta as Record<string, unknown> | undefined)?.metadata || {}) as Record<
+          string,
+          unknown
+        >;
+        return {
+          organizationId:
+            typeof customMeta.organizationId === 'string' && customMeta.organizationId.trim()
+              ? customMeta.organizationId.trim()
+              : undefined,
+          ownerId:
+            typeof customMeta.ownerId === 'string' && customMeta.ownerId.trim()
+              ? customMeta.ownerId.trim()
+              : undefined,
+        };
+      } catch (err) {
+        const code = (err as { code?: unknown } | null)?.code;
+        const msg = err instanceof Error ? err.message : '';
+        if (code === 404 || msg.includes('No such object')) {
+          return null;
+        }
+        throw err;
+      }
+    },
+
+    async listAudioObjectsPage(params: AudioStoragePageRequest): Promise<AudioStoragePageResult> {
+      const bucket = getAdminStorageBucket();
+      const prefix = params.prefix || 'organizations/';
+      const maxResults = Math.min(1000, Math.max(1, params.maxResults ?? 500));
+      const [files, nextQuery] = await bucket.getFiles({
         prefix,
         autoPaginate: false,
-        maxResults: 500,
+        maxResults,
+        ...(params.pageToken ? { pageToken: params.pageToken } : {}),
       });
-      return files.map((file) => {
-        const meta = file.metadata || {};
-        const customMeta = (meta.metadata || {}) as Record<string, unknown>;
-        const pathOrg = parseAudioOrgFromPath(file.name);
-        return {
-          path: file.name,
-          organizationId:
-            typeof customMeta.organizationId === 'string'
-              ? customMeta.organizationId
-              : pathOrg || undefined,
-          uploadedAt:
-            typeof customMeta.uploadedAt === 'string'
-              ? customMeta.uploadedAt
-              : typeof meta.timeCreated === 'string'
-              ? meta.timeCreated
-              : undefined,
-          updatedAt: typeof meta.updated === 'string' ? meta.updated : undefined,
-        };
-      });
+      const rawNextToken =
+        nextQuery && typeof (nextQuery as { pageToken?: unknown }).pageToken === 'string'
+          ? (nextQuery as { pageToken: string }).pageToken
+          : undefined;
+      return {
+        objects: files.map((file) =>
+          mapStorageFileSummary({
+            name: file.name,
+            metadata: file.metadata as Record<string, unknown> | undefined,
+          })
+        ),
+        ...(rawNextToken ? { nextPageToken: rawNextToken } : {}),
+      };
+    },
+
+    async listAudioObjects(prefix = 'organizations/'): Promise<AudioStorageObjectSummary[]> {
+      const all: AudioStorageObjectSummary[] = [];
+      let pageToken: string | undefined;
+      const seenTokens = new Set<string>();
+      do {
+        const page = await adapter.listAudioObjectsPage!({
+          prefix,
+          pageToken,
+          maxResults: 500,
+        });
+        all.push(...page.objects);
+        if (!page.nextPageToken || seenTokens.has(page.nextPageToken)) {
+          break;
+        }
+        seenTokens.add(page.nextPageToken);
+        pageToken = page.nextPageToken;
+      } while (pageToken);
+      return all;
     },
   };
+
+  return adapter;
 }
 
 export interface AudioCleanupSummary {
@@ -161,6 +258,8 @@ export interface AudioCleanupSummary {
   orphansScanned: number;
   orphansDeleted: number;
   orphansSkipped: number;
+  orphanPagesScanned: number;
+  orphanHasMore: boolean;
   results: Array<{
     songId: string;
     storageObjectPath: string;
@@ -178,6 +277,20 @@ export class AudioRetentionService {
   constructor(db: AdminFirestoreAdapter, storage: AudioStorageAdapter) {
     this.db = db;
     this.storage = storage;
+  }
+
+  private async verifyStorageMetadataOrg(
+    storagePath: string,
+    expectedOrgId: string
+  ): Promise<{ ok: true } | { ok: false; metadataOrg: string }> {
+    if (!this.storage.getAudioMetadata) {
+      return { ok: true };
+    }
+    const meta = await this.storage.getAudioMetadata(storagePath).catch(() => null);
+    if (meta?.organizationId && meta.organizationId !== expectedOrgId) {
+      return { ok: false, metadataOrg: meta.organizationId };
+    }
+    return { ok: true };
   }
 
   async logCleanupAttempt(params: {
@@ -212,6 +325,7 @@ export class AudioRetentionService {
     organizationId: string;
     songId?: string;
     deleteSongOnCleanup?: boolean;
+    storageDeleted?: boolean;
     reason: AudioCleanupReason;
     error?: unknown;
   }): Promise<AudioCleanupQueueItem> {
@@ -220,6 +334,7 @@ export class AudioRetentionService {
     const existing = await this.db.getDoc('audio_cleanup_queue', queueId).catch(() => null);
     const prevRetries =
       existing && typeof existing.retryCount === 'number' ? existing.retryCount : 0;
+    const prevStorageDeleted = existing?.storageDeleted === true;
     const safeErr = params.error
       ? sanitizeErrorMessage(params.error, 'Storage cleanup failed.')
       : 'Storage cleanup queued for retry.';
@@ -232,6 +347,7 @@ export class AudioRetentionService {
       ...(params.deleteSongOnCleanup !== undefined
         ? { deleteSongOnCleanup: params.deleteSongOnCleanup }
         : {}),
+      ...(params.storageDeleted || prevStorageDeleted ? { storageDeleted: true } : {}),
       reason: params.reason,
       status: 'pending',
       retryCount: prevRetries,
@@ -279,11 +395,45 @@ export class AudioRetentionService {
     return Array.from(map.values()).slice(0, limit);
   }
 
+  private async fetchNextOrphanPage(params: {
+    prefix: string;
+    pageToken?: string;
+    lastScannedPath?: string;
+    maxResults: number;
+  }): Promise<AudioStoragePageResult> {
+    if (this.storage.listAudioObjectsPage) {
+      return this.storage.listAudioObjectsPage({
+        prefix: params.prefix,
+        pageToken: params.pageToken,
+        maxResults: params.maxResults,
+      });
+    }
+    if (this.storage.listAudioObjects) {
+      const all = await this.storage.listAudioObjects(params.prefix);
+      const sorted = [...all].sort((a, b) => a.path.localeCompare(b.path));
+      const filtered = params.lastScannedPath
+        ? sorted.filter((entry) => entry.path > params.lastScannedPath!)
+        : sorted;
+      const slice = filtered.slice(0, params.maxResults);
+      const hasMore = filtered.length > slice.length;
+      const lastPath = slice.length > 0 ? slice[slice.length - 1].path : undefined;
+      return {
+        objects: slice,
+        ...(hasMore && lastPath ? { nextPageToken: `path:${lastPath}` } : {}),
+      };
+    }
+    return { objects: [] };
+  }
+
   async cleanupExpiredAudio(options?: {
     now?: Date;
     limit?: number;
     includeOrphans?: boolean;
     orphanGraceMinutes?: number;
+    orphanPageSize?: number;
+    orphanMaxPagesPerRun?: number;
+    orphanMaxObjectsPerRun?: number;
+    resetOrphanCursor?: boolean;
     organizationId?: string;
   }): Promise<AudioCleanupSummary> {
     const nowDate = options?.now ?? new Date();
@@ -302,6 +452,8 @@ export class AudioRetentionService {
         orphansScanned: 0,
         orphansDeleted: 0,
         orphansSkipped: 0,
+        orphanPagesScanned: 0,
+        orphanHasMore: false,
         results: [],
       };
     }
@@ -348,6 +500,12 @@ export class AudioRetentionService {
       let queueFailed = 0;
       const results: AudioCleanupSummary['results'] = [];
       const handledPaths = new Set<string>();
+      const queueByPath = new Map<string, Record<string, unknown>>();
+      for (const q of queueItems) {
+        if (typeof q.storageObjectPath === 'string') {
+          queueByPath.set(q.storageObjectPath, q);
+        }
+      }
 
       // Phase 1: Expired retention songs
       for (const song of candidates) {
@@ -371,11 +529,27 @@ export class AudioRetentionService {
           continue;
         }
 
+        const metaCheck = await this.verifyStorageMetadataOrg(storagePath, orgId);
+        if (!metaCheck.ok) {
+          skipped += 1;
+          logStructured('warn', 'audio_cleanup_metadata_org_mismatch_skipped', {
+            songId,
+            songOrg: orgId,
+            metadataOrg: metaCheck.metadataOrg,
+          });
+          continue;
+        }
+
         handledPaths.add(storagePath);
         const attemptIso = new Date().toISOString();
+        const existingQueue = queueByPath.get(storagePath);
+        let storageDeletedThisAttempt = existingQueue?.storageDeleted === true;
 
         try {
-          await this.storage.deleteAudioObject(storagePath);
+          if (!storageDeletedThisAttempt) {
+            await this.storage.deleteAudioObject(storagePath);
+            storageDeletedThisAttempt = true;
+          }
 
           await this.db.updateDoc('songs', songId, {
             audioStorageCleanupStatus: 'deleted',
@@ -384,7 +558,7 @@ export class AudioRetentionService {
             updatedAt: SERVER_TIMESTAMP_SENTINEL,
           });
 
-          // Remove any pending queue item for this path now that it succeeded
+          // Remove any pending queue item for this path only after song update succeeded
           await this.db
             .deleteDoc('audio_cleanup_queue', makeCleanupQueueDocId(storagePath))
             .catch(() => null);
@@ -407,23 +581,36 @@ export class AudioRetentionService {
           });
         } catch (err) {
           const safeErr = sanitizeErrorMessage(err, 'Storage deletion failed.');
-          try {
-            await this.db.updateDoc('songs', songId, {
-              audioStorageCleanupStatus: 'cleanup_failed',
-              audioCleanupError: safeErr.slice(0, 380),
-              updatedAt: SERVER_TIMESTAMP_SENTINEL,
-            });
-            await this.logCleanupAttempt({
-              songId,
-              organizationId: orgId,
+          if (storageDeletedThisAttempt) {
+            // Storage was deleted, but Firestore song update failed -> persist durable queue task so it is retried safely
+            await this.enqueueCleanupTask({
               storageObjectPath: storagePath,
-              status: 'failed',
+              organizationId: orgId,
+              songId,
+              deleteSongOnCleanup: false,
+              storageDeleted: true,
               reason: 'retention_expired',
-              error: safeErr,
-              attemptedAt: attemptIso,
-            });
-          } catch {
-            // Non-fatal logging error
+              error: err,
+            }).catch(() => null);
+          } else {
+            try {
+              await this.db.updateDoc('songs', songId, {
+                audioStorageCleanupStatus: 'cleanup_failed',
+                audioCleanupError: safeErr.slice(0, 380),
+                updatedAt: SERVER_TIMESTAMP_SENTINEL,
+              });
+              await this.logCleanupAttempt({
+                songId,
+                organizationId: orgId,
+                storageObjectPath: storagePath,
+                status: 'failed',
+                reason: 'retention_expired',
+                error: safeErr,
+                attemptedAt: attemptIso,
+              });
+            } catch {
+              // Non-fatal logging error
+            }
           }
 
           failed += 1;
@@ -470,28 +657,66 @@ export class AudioRetentionService {
         if (handledPaths.has(storagePath)) {
           continue;
         }
+
+        let storageDeletedThisAttempt = item.storageDeleted === true;
+        if (!storageDeletedThisAttempt) {
+          const metaCheck = await this.verifyStorageMetadataOrg(storagePath, orgId);
+          if (!metaCheck.ok) {
+            skipped += 1;
+            logStructured('warn', 'audio_queue_metadata_org_mismatch_skipped', {
+              queueId,
+              orgId,
+              metadataOrg: metaCheck.metadataOrg,
+            });
+            continue;
+          }
+        }
+
         handledPaths.add(storagePath);
         queueScanned += 1;
 
         const attemptIso = new Date().toISOString();
         try {
-          await this.storage.deleteAudioObject(storagePath);
+          if (!storageDeletedThisAttempt) {
+            await this.storage.deleteAudioObject(storagePath);
+            storageDeletedThisAttempt = true;
+          }
 
-          if (songId) {
+          // Perform every required Firestore song operation WITHOUT swallowing errors
+          if (songId && songId !== 'orphan' && songId !== 'rollback_gemini_failed') {
             if (deleteSongOnCleanup) {
-              await this.db.deleteDoc('songs', songId).catch(() => null);
+              const existingSong = await this.db.getDoc('songs', songId);
+              if (existingSong) {
+                const existingSongOrg =
+                  typeof existingSong.organizationId === 'string'
+                    ? existingSong.organizationId
+                    : '';
+                if (existingSongOrg && existingSongOrg !== orgId) {
+                  throw new Error('Cross-organization song record mismatch during cleanup.');
+                }
+                await this.db.deleteDoc('songs', songId);
+              }
             } else {
-              await this.db
-                .updateDoc('songs', songId, {
+              const existingSong = await this.db.getDoc('songs', songId);
+              if (existingSong) {
+                const existingSongOrg =
+                  typeof existingSong.organizationId === 'string'
+                    ? existingSong.organizationId
+                    : '';
+                if (existingSongOrg && existingSongOrg !== orgId) {
+                  throw new Error('Cross-organization song record mismatch during cleanup.');
+                }
+                await this.db.updateDoc('songs', songId, {
                   audioStorageCleanupStatus: 'deleted',
                   audioDeletedAt: attemptIso,
                   audioCleanupError: '',
                   updatedAt: SERVER_TIMESTAMP_SENTINEL,
-                })
-                .catch(() => null);
+                });
+              }
             }
           }
 
+          // Only delete the queue item after BOTH Storage deletion and all required Firestore operations succeed
           await this.db.deleteDoc('audio_cleanup_queue', queueId);
           await this.logCleanupAttempt({
             songId: songId || 'unregistered',
@@ -515,6 +740,7 @@ export class AudioRetentionService {
           const nextRetryCount =
             typeof item.retryCount === 'number' ? item.retryCount + 1 : 1;
 
+          // Preserve queue item (marking storageDeleted=true if Storage already succeeded so retry resumes remaining Firestore work)
           await this.db
             .setDoc(
               'audio_cleanup_queue',
@@ -523,13 +749,14 @@ export class AudioRetentionService {
                 status: 'failed',
                 retryCount: nextRetryCount,
                 lastError: safeErr.slice(0, 380),
+                ...(storageDeletedThisAttempt ? { storageDeleted: true } : {}),
                 updatedAt: attemptIso,
               },
               true
             )
             .catch(() => null);
 
-          if (songId) {
+          if (songId && songId !== 'orphan' && songId !== 'rollback_gemini_failed') {
             await this.db
               .updateDoc('songs', songId, {
                 audioStorageCleanupStatus: 'cleanup_failed',
@@ -561,12 +788,17 @@ export class AudioRetentionService {
         }
       }
 
-      // Phase 3: Reconcile orphaned Storage objects (no corresponding song document)
+      // Phase 3: Full-pagination orphan reconciliation with durable cursor progression
       let orphansScanned = 0;
       let orphansDeleted = 0;
       let orphansSkipped = 0;
+      let orphanPagesScanned = 0;
+      let orphanHasMore = false;
 
-      if (options?.includeOrphans !== false && this.storage.listAudioObjects) {
+      if (
+        options?.includeOrphans !== false &&
+        (this.storage.listAudioObjectsPage || this.storage.listAudioObjects)
+      ) {
         const orphanGraceMinutes =
           options?.orphanGraceMinutes ??
           (Number(process.env.ORPHAN_AUDIO_GRACE_MINUTES) >= 0 &&
@@ -576,105 +808,212 @@ export class AudioRetentionService {
         const graceMs = Math.max(0, orphanGraceMinutes) * 60 * 1000;
         const prefix = filterOrgId ? `organizations/${filterOrgId}/audio/` : 'organizations/';
 
-        const listed = await this.storage.listAudioObjects(prefix).catch((err) => {
-          logStructured('warn', 'orphan_audio_list_failed', {
-            error: sanitizeErrorMessage(err),
-          });
-          return [] as AudioStorageObjectSummary[];
-        });
+        const pageSize = Math.min(1000, Math.max(1, options?.orphanPageSize ?? 500));
+        const maxPagesPerRun = Math.min(200, Math.max(1, options?.orphanMaxPagesPerRun ?? 20));
+        const maxObjectsPerRun =
+          options?.orphanMaxObjectsPerRun !== undefined
+            ? Math.max(1, options.orphanMaxObjectsPerRun)
+            : pageSize * maxPagesPerRun;
 
-        for (const obj of listed.slice(0, limit)) {
-          if (handledPaths.has(obj.path)) continue;
-          const pathOrg = parseAudioOrgFromPath(obj.path);
-          if (!pathOrg) {
-            orphansSkipped += 1;
-            continue;
-          }
-          if (filterOrgId && pathOrg !== filterOrgId) {
-            orphansSkipped += 1;
-            continue;
-          }
-          // Cross-org protection: never delete if object metadata claims a different organization
-          if (obj.organizationId && obj.organizationId !== pathOrg) {
-            orphansSkipped += 1;
-            logStructured('warn', 'orphan_audio_cross_org_metadata_skipped', {
-              path: obj.path,
-              pathOrg,
-              metadataOrg: obj.organizationId,
-            });
-            continue;
-          }
+        const cursorDocId = makeOrphanCursorDocId(filterOrgId);
+        const existingCursor = options?.resetOrphanCursor
+          ? null
+          : await this.db.getDoc('audio_cleanup_cursors', cursorDocId).catch(() => null);
 
-          const timestampStr = obj.uploadedAt || obj.updatedAt;
-          const objTimeMs = timestampStr ? Date.parse(timestampStr) : NaN;
-          if (!Number.isFinite(objTimeMs) || nowDate.getTime() - objTimeMs < graceMs) {
-            orphansSkipped += 1;
-            continue;
-          }
+        let currentPageToken =
+          existingCursor &&
+          typeof existingCursor.nextPageToken === 'string' &&
+          existingCursor.nextPageToken
+            ? existingCursor.nextPageToken
+            : undefined;
+        let currentLastPath =
+          existingCursor &&
+          typeof existingCursor.lastScannedPath === 'string' &&
+          existingCursor.lastScannedPath
+            ? existingCursor.lastScannedPath
+            : undefined;
+        const prevCyclePages =
+          existingCursor && typeof existingCursor.pagesScannedInCycle === 'number'
+            ? existingCursor.pagesScannedInCycle
+            : 0;
 
-          orphansScanned += 1;
+        let objectsSeenInRun = 0;
+        let lastScannedPathInRun = currentLastPath || '';
+        const seenPageTokens = new Set<string>();
+        let tokenResetTried = false;
 
-          // Fail safe: if querying songs throws, DO NOT treat the object as orphaned
-          let matchingSongs: Array<Record<string, unknown>>;
+        while (orphanPagesScanned < maxPagesPerRun && objectsSeenInRun < maxObjectsPerRun) {
+          const remainingBudget = maxObjectsPerRun - objectsSeenInRun;
+          const batchMaxResults = Math.min(pageSize, remainingBudget);
+
+          let page: AudioStoragePageResult;
           try {
-            matchingSongs = await this.db.queryDocs(
-              'songs',
-              [{ field: 'audioStoragePath', op: '==', value: obj.path }],
-              { limit: 5 }
-            );
+            page = await this.fetchNextOrphanPage({
+              prefix,
+              pageToken: currentPageToken,
+              lastScannedPath: currentLastPath,
+              maxResults: batchMaxResults,
+            });
           } catch (err) {
-            orphansSkipped += 1;
-            logStructured('error', 'orphan_audio_song_lookup_failed', {
-              path: obj.path,
+            if ((currentPageToken || currentLastPath) && !tokenResetTried) {
+              tokenResetTried = true;
+              logStructured('warn', 'orphan_audio_cursor_reset_on_error', {
+                cursorDocId,
+                error: sanitizeErrorMessage(err),
+              });
+              currentPageToken = undefined;
+              currentLastPath = undefined;
+              continue;
+            }
+            logStructured('warn', 'orphan_audio_list_failed', {
               error: sanitizeErrorMessage(err),
             });
-            continue;
+            break;
           }
 
-          if (matchingSongs.length > 0) {
-            // Active or registered song doc references this file (never delete)
-            orphansSkipped += 1;
-            continue;
+          orphanPagesScanned += 1;
+          objectsSeenInRun += page.objects.length;
+
+          for (const obj of page.objects) {
+            lastScannedPathInRun = obj.path;
+            if (handledPaths.has(obj.path)) continue;
+
+            const pathOrg = parseAudioOrgFromPath(obj.path);
+            if (!pathOrg) {
+              orphansSkipped += 1;
+              continue;
+            }
+            if (filterOrgId && pathOrg !== filterOrgId) {
+              orphansSkipped += 1;
+              continue;
+            }
+            // Cross-org protection: never delete if object metadata claims a different organization
+            if (obj.organizationId && (obj.organizationId !== pathOrg || (filterOrgId && obj.organizationId !== filterOrgId))) {
+              orphansSkipped += 1;
+              logStructured('warn', 'orphan_audio_cross_org_metadata_skipped', {
+                path: obj.path,
+                pathOrg,
+                metadataOrg: obj.organizationId,
+              });
+              continue;
+            }
+
+            const timestampStr = obj.uploadedAt || obj.updatedAt;
+            const objTimeMs = timestampStr ? Date.parse(timestampStr) : NaN;
+            if (!Number.isFinite(objTimeMs) || nowDate.getTime() - objTimeMs < graceMs) {
+              orphansSkipped += 1;
+              continue;
+            }
+
+            orphansScanned += 1;
+
+            // Fail safe: if querying songs throws, DO NOT treat the object as orphaned
+            let matchingSongs: Array<Record<string, unknown>>;
+            try {
+              matchingSongs = await this.db.queryDocs(
+                'songs',
+                [{ field: 'audioStoragePath', op: '==', value: obj.path }],
+                { limit: 5 }
+              );
+            } catch (err) {
+              orphansSkipped += 1;
+              logStructured('error', 'orphan_audio_song_lookup_failed', {
+                path: obj.path,
+                error: sanitizeErrorMessage(err),
+              });
+              continue;
+            }
+
+            if (matchingSongs.length > 0) {
+              // Active or registered song doc references this file (never delete)
+              orphansSkipped += 1;
+              continue;
+            }
+
+            const attemptIso = new Date().toISOString();
+            try {
+              await this.storage.deleteAudioObject(obj.path);
+              await this.logCleanupAttempt({
+                songId: 'orphan',
+                organizationId: pathOrg,
+                storageObjectPath: obj.path,
+                status: 'deleted',
+                reason: 'orphan_reconciled',
+                attemptedAt: attemptIso,
+              });
+              orphansDeleted += 1;
+              deleted += 1;
+              results.push({
+                songId: 'orphan',
+                storageObjectPath: obj.path,
+                status: 'deleted',
+                reason: 'orphan_reconciled',
+              });
+            } catch (err) {
+              const safeErr = sanitizeErrorMessage(err, 'Orphan audio deletion failed.');
+              await this.enqueueCleanupTask({
+                storageObjectPath: obj.path,
+                organizationId: pathOrg,
+                deleteSongOnCleanup: false,
+                reason: 'orphan_reconciled',
+                error: err,
+              }).catch(() => null);
+              failed += 1;
+              results.push({
+                songId: 'orphan',
+                storageObjectPath: obj.path,
+                status: 'failed',
+                reason: 'orphan_reconciled',
+                error: safeErr,
+              });
+            }
           }
 
-          const attemptIso = new Date().toISOString();
-          try {
-            await this.storage.deleteAudioObject(obj.path);
-            await this.logCleanupAttempt({
-              songId: 'orphan',
-              organizationId: pathOrg,
-              storageObjectPath: obj.path,
-              status: 'deleted',
-              reason: 'orphan_reconciled',
-              attemptedAt: attemptIso,
-            });
-            orphansDeleted += 1;
-            deleted += 1;
-            results.push({
-              songId: 'orphan',
-              storageObjectPath: obj.path,
-              status: 'deleted',
-              reason: 'orphan_reconciled',
-            });
-          } catch (err) {
-            const safeErr = sanitizeErrorMessage(err, 'Orphan audio deletion failed.');
-            await this.enqueueCleanupTask({
-              storageObjectPath: obj.path,
-              organizationId: pathOrg,
-              songId: 'orphan',
-              deleteSongOnCleanup: false,
-              reason: 'orphan_reconciled',
-              error: err,
-            }).catch(() => null);
-            failed += 1;
-            results.push({
-              songId: 'orphan',
-              storageObjectPath: obj.path,
-              status: 'failed',
-              reason: 'orphan_reconciled',
-              error: safeErr,
-            });
+          if (!page.nextPageToken || seenPageTokens.has(page.nextPageToken)) {
+            currentPageToken = undefined;
+            currentLastPath = undefined;
+            break;
           }
+          seenPageTokens.add(page.nextPageToken);
+          currentPageToken = page.nextPageToken;
+          currentLastPath = lastScannedPathInRun;
+        }
+
+        if (currentPageToken) {
+          orphanHasMore = true;
+          await this.db
+            .setDoc(
+              'audio_cleanup_cursors',
+              cursorDocId,
+              {
+                id: cursorDocId,
+                organizationId: filterOrgId || 'all',
+                nextPageToken: currentPageToken,
+                lastScannedPath: lastScannedPathInRun,
+                pagesScannedInCycle: prevCyclePages + orphanPagesScanned,
+                updatedAt: nowIso,
+              },
+              true
+            )
+            .catch(() => null);
+        } else {
+          orphanHasMore = false;
+          await this.db
+            .setDoc(
+              'audio_cleanup_cursors',
+              cursorDocId,
+              {
+                id: cursorDocId,
+                organizationId: filterOrgId || 'all',
+                nextPageToken: '',
+                lastScannedPath: '',
+                pagesScannedInCycle: 0,
+                cycleCompletedAt: nowIso,
+                updatedAt: nowIso,
+              },
+              true
+            )
+            .catch(() => null);
         }
       }
 
@@ -682,6 +1021,8 @@ export class AudioRetentionService {
         scanned: candidates.length,
         queueScanned,
         orphansScanned,
+        orphanPagesScanned,
+        orphanHasMore,
         deleted,
         failed,
         skipped,
@@ -699,6 +1040,8 @@ export class AudioRetentionService {
         orphansScanned,
         orphansDeleted,
         orphansSkipped,
+        orphanPagesScanned,
+        orphanHasMore,
         results,
       };
     } finally {

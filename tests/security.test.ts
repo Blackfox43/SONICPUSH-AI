@@ -44,6 +44,8 @@ interface TestFirestoreController {
   adapter: AdminFirestoreAdapter;
   docs: Record<string, Record<string, Record<string, unknown>>>;
   failNextTransactionCount: number;
+  failDeleteCounts: Map<string, number>;
+  failUpdateCounts: Map<string, number>;
 }
 
 function createInMemoryAdminFirestore(
@@ -53,10 +55,14 @@ function createInMemoryAdminFirestore(
     initialDocs || {}
   );
   let txQueue: Promise<unknown> = Promise.resolve();
+  const failDeleteCounts = new Map<string, number>();
+  const failUpdateCounts = new Map<string, number>();
 
   const controller: TestFirestoreController = {
     docs,
     failNextTransactionCount: 0,
+    failDeleteCounts,
+    failUpdateCounts,
     adapter: {
       async getDoc(col, id) {
         const hit = docs[col]?.[id];
@@ -68,12 +74,24 @@ function createInMemoryAdminFirestore(
         docs[col][id] = merge && docs[col][id] ? { ...docs[col][id], ...clean } : clean;
       },
       async updateDoc(col, id, data) {
+        const key = `${col}/${id}`;
+        const rem = failUpdateCounts.get(key) || 0;
+        if (rem > 0) {
+          failUpdateCounts.set(key, rem - 1);
+          throw new Error(`SIMULATED_FIRESTORE_UPDATE_FAILURE:${key}`);
+        }
         if (!docs[col]?.[id]) {
           throw new Error(`NOT_FOUND:${col}/${id}`);
         }
         docs[col][id] = { ...docs[col][id], ...cloneValue(data) };
       },
       async deleteDoc(col, id) {
+        const key = `${col}/${id}`;
+        const rem = failDeleteCounts.get(key) || 0;
+        if (rem > 0) {
+          failDeleteCounts.set(key, rem - 1);
+          throw new Error(`SIMULATED_FIRESTORE_DELETE_FAILURE:${key}`);
+        }
         if (docs[col]) {
           delete docs[col][id];
         }
@@ -210,18 +228,58 @@ function createInMemoryAudioStorage() {
       if (!hit) throw new Error('OBJECT_NOT_FOUND');
       return { buffer: Buffer.from(hit.buffer), contentType: hit.contentType };
     },
+    async getAudioMetadata(storageObjectPath) {
+      const hit = objects.get(storageObjectPath);
+      if (!hit) return null;
+      return {
+        organizationId: hit.organizationId || undefined,
+        ownerId: hit.ownerId || undefined,
+      };
+    },
+    async listAudioObjectsPage({ prefix = 'organizations/', pageToken, maxResults = 500 }) {
+      const sortedPaths = Array.from(objects.keys())
+        .filter((p) => p.startsWith(prefix))
+        .sort((a, b) => a.localeCompare(b));
+      let afterPath: string | undefined;
+      if (pageToken && pageToken.startsWith('after:')) {
+        afterPath = Buffer.from(pageToken.slice(6), 'base64').toString('utf8');
+      }
+      const eligible = afterPath
+        ? sortedPaths.filter((p) => p > afterPath!)
+        : sortedPaths;
+      const limit = Math.max(1, maxResults);
+      const pagePaths = eligible.slice(0, limit);
+      const hasMore = eligible.length > pagePaths.length;
+      const pageObjects = pagePaths.map((path) => {
+        const entry = objects.get(path)!;
+        return {
+          path,
+          organizationId: entry.organizationId || undefined,
+          uploadedAt: entry.uploadedAt,
+          updatedAt: entry.uploadedAt,
+        };
+      });
+      const nextPageToken =
+        hasMore && pagePaths.length > 0
+          ? `after:${Buffer.from(pagePaths[pagePaths.length - 1], 'utf8').toString('base64')}`
+          : undefined;
+      return {
+        objects: pageObjects,
+        ...(nextPageToken ? { nextPageToken } : {}),
+      };
+    },
     async listAudioObjects(prefix = 'organizations/') {
       const out = [];
-      for (const [path, entry] of objects.entries()) {
-        if (path.startsWith(prefix)) {
-          out.push({
-            path,
-            organizationId: entry.organizationId,
-            uploadedAt: entry.uploadedAt,
-            updatedAt: entry.uploadedAt,
-          });
-        }
-      }
+      let pageToken: string | undefined;
+      do {
+        const page = await adapter.listAudioObjectsPage!({
+          prefix,
+          pageToken,
+          maxResults: 500,
+        });
+        out.push(...page.objects);
+        pageToken = page.nextPageToken;
+      } while (pageToken);
       return out;
     },
   };
@@ -2090,4 +2148,267 @@ test('8. Phase 2.1 Audio Integrity: Gemini failure rollback & queue retry, Song 
   assert.equal(storageOrphan.objects.has(orphanOldB), true);
   assert.equal(storageOrphan.objects.has(mismatchedMetaA), true);
 });
+
+test('9. Final Cleanup Reliability: Storage-succeeded Firestore-failed preserves queue, retries remaining work, >500 full pagination & progressive cursor, and org isolation', async () => {
+  // 9a. Storage deletion succeeds on DELETE /api/songs/:songId, Firestore delete fails -> queues deleteSongOnCleanup=true + storageDeleted=true + 502 cleanupPending
+  const storagePartial = createInMemoryAudioStorage();
+  const partialPath = 'organizations/org_a/audio/partial-del-1.mp3';
+  storagePartial.seedObject(partialPath, {
+    organizationId: 'org_a',
+    ownerId: 'uid_prom_a',
+    uploadedAt: '2026-01-01T00:00:00.000Z',
+  });
+
+  const envPartial = buildTestEnvironment({ audioStorage: storagePartial });
+  await envPartial.dbController.adapter.setDoc('songs', 'song_partial_del', {
+    id: 'song_partial_del',
+    organizationId: 'org_a',
+    ownerId: 'uid_prom_a',
+    assignedUserIds: ['uid_prom_a'],
+    title: 'Partial Failure Song',
+    audioStoragePath: partialPath,
+    audioStorageCleanupStatus: 'active',
+  });
+  // Fail the next TWO Firestore delete attempts on songs/song_partial_del:
+  // 1st failure during DELETE /api/songs/:songId, 2nd failure during first queue retry!
+  envPartial.dbController.failDeleteCounts.set('songs/song_partial_del', 2);
+
+  await withLiveServer(envPartial.app, async (baseUrl) => {
+    const delRes = await fetch(`${baseUrl}/api/songs/song_partial_del`, {
+      method: 'DELETE',
+      headers: { Authorization: 'Bearer token-promoter-a' },
+    });
+    assert.equal(delRes.status, 502);
+    const delBody = (await delRes.json()) as {
+      ok: boolean;
+      deleted: boolean;
+      cleanupPending: boolean;
+      cleanupQueued: boolean;
+      storageDeleted: boolean;
+    };
+    assert.equal(delBody.ok, false);
+    assert.equal(delBody.deleted, false);
+    assert.equal(delBody.cleanupPending, true);
+    assert.equal(delBody.cleanupQueued, true);
+    assert.equal(delBody.storageDeleted, true);
+
+    // Storage is already empty, song doc preserved, queue item persisted with deleteSongOnCleanup + storageDeleted
+    assert.equal(storagePartial.objects.has(partialPath), false);
+    assert.ok(envPartial.dbController.docs.songs.song_partial_del);
+    const q1 = Object.values(envPartial.dbController.docs.audio_cleanup_queue || {});
+    assert.equal(q1.length, 1);
+    assert.equal(q1[0].songId, 'song_partial_del');
+    assert.equal(q1[0].deleteSongOnCleanup, true);
+    assert.equal(q1[0].storageDeleted, true);
+
+    // First retry fails on Firestore deleteDoc -> queue item MUST STILL BE PRESERVED!
+    const retry1 = await envPartial.retentionService.cleanupExpiredAudio({
+      includeOrphans: false,
+    });
+    assert.equal(retry1.queueScanned, 1);
+    assert.equal(retry1.queueFailed, 1);
+    assert.equal(retry1.queueDeleted, 0);
+    assert.ok(envPartial.dbController.docs.songs.song_partial_del);
+    const q2 = Object.values(envPartial.dbController.docs.audio_cleanup_queue || {});
+    assert.equal(q2.length, 1);
+    assert.equal(q2[0].status, 'failed');
+    assert.equal(q2[0].retryCount, 1);
+    assert.equal(q2[0].storageDeleted, true);
+
+    // Second retry succeeds -> song doc AND queue item both removed cleanly
+    const retry2 = await envPartial.retentionService.cleanupExpiredAudio({
+      includeOrphans: false,
+    });
+    assert.equal(retry2.queueScanned, 1);
+    assert.equal(retry2.queueDeleted, 1);
+    assert.equal(retry2.queueFailed, 0);
+    assert.equal(envPartial.dbController.docs.songs.song_partial_del, undefined);
+    assert.equal(Object.keys(envPartial.dbController.docs.audio_cleanup_queue || {}).length, 0);
+  });
+
+  // 9b. Queue item with deleteSongOnCleanup=false (updateDoc failure after Storage deletion) preserves queue until updateDoc succeeds
+  const storageUpdateFail = createInMemoryAudioStorage();
+  const updatePath = 'organizations/org_a/audio/update-fail-1.mp3';
+  storageUpdateFail.seedObject(updatePath, {
+    organizationId: 'org_a',
+    uploadedAt: '2025-01-01T00:00:00.000Z',
+  });
+  const envUpdateFail = buildTestEnvironment({ audioStorage: storageUpdateFail });
+  await envUpdateFail.dbController.adapter.setDoc('songs', 'song_update_fail', {
+    id: 'song_update_fail',
+    organizationId: 'org_a',
+    ownerId: 'uid_prom_a',
+    assignedUserIds: ['uid_prom_a'],
+    title: 'Update Fail Song',
+    audioStoragePath: updatePath,
+    audioRetentionExpiresAt: '2026-06-01T00:00:00.000Z',
+    audioStorageCleanupStatus: 'active',
+  });
+  await envUpdateFail.retentionService.enqueueCleanupTask({
+    storageObjectPath: updatePath,
+    organizationId: 'org_a',
+    songId: 'song_update_fail',
+    deleteSongOnCleanup: false,
+    reason: 'retention_expired',
+  });
+  // Fail updateDoc on songs/song_update_fail once -> Storage deletes, updateDoc fails, queue stays!
+  envUpdateFail.dbController.failUpdateCounts.set('songs/song_update_fail', 1);
+
+  const uRetry1 = await envUpdateFail.retentionService.cleanupExpiredAudio({
+    now: new Date('2026-01-01T00:00:00.000Z'),
+    includeOrphans: false,
+  });
+  assert.equal(uRetry1.queueFailed, 1);
+  assert.equal(storageUpdateFail.objects.has(updatePath), false);
+  const uQueueAfter1 = Object.values(envUpdateFail.dbController.docs.audio_cleanup_queue || {});
+  assert.equal(uQueueAfter1.length, 1);
+  assert.equal(uQueueAfter1[0].storageDeleted, true);
+
+  // Next retry completes updateDoc -> 'deleted' and removes queue item
+  const uRetry2 = await envUpdateFail.retentionService.cleanupExpiredAudio({
+    now: new Date('2026-01-01T00:00:00.000Z'),
+    includeOrphans: false,
+  });
+  assert.equal(uRetry2.queueDeleted, 1);
+  assert.equal(envUpdateFail.dbController.docs.songs.song_update_fail.audioStorageCleanupStatus, 'deleted');
+  assert.equal(Object.keys(envUpdateFail.dbController.docs.audio_cleanup_queue || {}).length, 0);
+
+  // 9c. >500 Storage objects (1,250 objects across 3 pages) reconciled progressively across scheduled runs AND in full scan, with cross-org protection
+  const storageLarge = createInMemoryAudioStorage();
+  const oldIso = '2026-01-01T00:00:00.000Z';
+  const runNow = new Date('2026-05-01T12:00:00.000Z');
+
+  // Seed 1,250 objects in org_a: first 520 are active songs, remaining 730 (positions 521..1250) are orphans!
+  // Plus 1 cross-org metadata mismatch in org_a & 10 orphans in org_b that MUST NEVER be deleted when scanning org_a.
+  const envLarge = buildTestEnvironment({ audioStorage: storageLarge });
+  for (let i = 0; i < 1250; i++) {
+    const padded = String(i).padStart(4, '0');
+    const objPath = `organizations/org_a/audio/track-${padded}.mp3`;
+    storageLarge.seedObject(objPath, {
+      organizationId: 'org_a',
+      uploadedAt: oldIso,
+    });
+    if (i < 520) {
+      await envLarge.dbController.adapter.setDoc('songs', `song_large_${padded}`, {
+        id: `song_large_${padded}`,
+        organizationId: 'org_a',
+        ownerId: 'uid_prom_a',
+        assignedUserIds: ['uid_prom_a'],
+        title: `Active ${padded}`,
+        audioStoragePath: objPath,
+        audioStorageCleanupStatus: 'active',
+        audioRetentionExpiresAt: '2027-01-01T00:00:00.000Z',
+      });
+    }
+  }
+
+  const mismatchInLarge = 'organizations/org_a/audio/track-9999-crossmeta.mp3';
+  storageLarge.seedObject(mismatchInLarge, {
+    organizationId: 'org_b', // conflicts with org_a path!
+    uploadedAt: oldIso,
+  });
+  for (let j = 0; j < 10; j++) {
+    storageLarge.seedObject(`organizations/org_b/audio/orgb-${j}.mp3`, {
+      organizationId: 'org_b',
+      uploadedAt: oldIso,
+    });
+  }
+
+  // Progressive scheduled runs (1 page of 500 per run) inspect all >500 items across 3 runs without starving pages 2 & 3!
+  const schedRun1 = await envLarge.retentionService.cleanupExpiredAudio({
+    now: runNow,
+    includeOrphans: true,
+    orphanGraceMinutes: 60,
+    orphanPageSize: 500,
+    orphanMaxPagesPerRun: 1,
+    organizationId: 'org_a',
+  });
+  assert.equal(schedRun1.orphanPagesScanned, 1);
+  assert.equal(schedRun1.orphansScanned, 500);
+  assert.equal(schedRun1.orphansDeleted, 0); // All first 500 are active songs
+  assert.equal(schedRun1.orphanHasMore, true);
+
+  const schedRun2 = await envLarge.retentionService.cleanupExpiredAudio({
+    now: runNow,
+    includeOrphans: true,
+    orphanGraceMinutes: 60,
+    orphanPageSize: 500,
+    orphanMaxPagesPerRun: 1,
+    organizationId: 'org_a',
+  });
+  assert.equal(schedRun2.orphanPagesScanned, 1);
+  assert.equal(schedRun2.orphansScanned, 500); // Objects 500..999 (20 active + 480 orphans!)
+  assert.equal(schedRun2.orphansDeleted, 480);
+  assert.equal(schedRun2.orphanHasMore, true);
+
+  const schedRun3 = await envLarge.retentionService.cleanupExpiredAudio({
+    now: runNow,
+    includeOrphans: true,
+    orphanGraceMinutes: 60,
+    orphanPageSize: 500,
+    orphanMaxPagesPerRun: 1,
+    organizationId: 'org_a',
+  });
+  assert.equal(schedRun3.orphanPagesScanned, 1);
+  assert.equal(schedRun3.orphansScanned, 250); // Remaining 250 org_a orphans (mismatchInLarge skipped before lookup)
+  assert.equal(schedRun3.orphansDeleted, 250);
+  assert.equal(schedRun3.orphanHasMore, false); // Cursor resets cleanly at end of bucket!
+
+  // Verify 520 active songs remain, cross-org metadata mismatch remains, and all 10 org_b objects remain!
+  assert.equal(storageLarge.objects.has(mismatchInLarge), true);
+  assert.equal(storageLarge.objects.has('organizations/org_a/audio/track-0000.mp3'), true);
+  assert.equal(storageLarge.objects.has('organizations/org_a/audio/track-0519.mp3'), true);
+  assert.equal(storageLarge.objects.has('organizations/org_a/audio/track-0520.mp3'), false);
+  assert.equal(storageLarge.objects.has('organizations/org_a/audio/track-1249.mp3'), false);
+  for (let j = 0; j < 10; j++) {
+    assert.equal(storageLarge.objects.has(`organizations/org_b/audio/orgb-${j}.mp3`), true);
+  }
+
+  // Also verify single multi-page run reconciles >500 newly added orphans across multiple pages in one call
+  for (let k = 0; k < 650; k++) {
+    storageLarge.seedObject(`organizations/org_a/audio/bulk-${String(k).padStart(4, '0')}.mp3`, {
+      organizationId: 'org_a',
+      uploadedAt: oldIso,
+    });
+  }
+  const fullMultiPage = await envLarge.retentionService.cleanupExpiredAudio({
+    now: runNow,
+    includeOrphans: true,
+    orphanGraceMinutes: 60,
+    orphanPageSize: 300,
+    orphanMaxPagesPerRun: 10,
+    organizationId: 'org_a',
+  });
+  assert.equal(fullMultiPage.orphanPagesScanned, 4); // 520 active + 650 bulk + 1 mismatch = 1,171 objects across 4 pages of 300!
+  assert.equal(fullMultiPage.orphansDeleted, 650);
+  assert.equal(fullMultiPage.orphanHasMore, false);
+  assert.equal(storageLarge.objects.has(mismatchInLarge), true);
+  assert.equal(storageLarge.objects.has('organizations/org_b/audio/orgb-0.mp3'), true);
+
+  // 9d. Cross-org metadata conflict blocks DELETE /api/songs/:songId too
+  const crossMetaPath = 'organizations/org_a/audio/song-meta-conflict.mp3';
+  storageLarge.seedObject(crossMetaPath, {
+    organizationId: 'org_b',
+    uploadedAt: oldIso,
+  });
+  await envLarge.dbController.adapter.setDoc('songs', 'song_meta_conflict', {
+    id: 'song_meta_conflict',
+    organizationId: 'org_a',
+    ownerId: 'uid_prom_a',
+    assignedUserIds: ['uid_prom_a'],
+    title: 'Metadata Conflict Song',
+    audioStoragePath: crossMetaPath,
+    audioStorageCleanupStatus: 'active',
+  });
+  await withLiveServer(envLarge.app, async (baseUrl) => {
+    const blockedDel = await fetch(`${baseUrl}/api/songs/song_meta_conflict`, {
+      method: 'DELETE',
+      headers: { Authorization: 'Bearer token-promoter-a' },
+    });
+    assert.equal(blockedDel.status, 403);
+    assert.equal(storageLarge.objects.has(crossMetaPath), true);
+    assert.ok(envLarge.dbController.docs.songs.song_meta_conflict);
+  });
+});
+
 

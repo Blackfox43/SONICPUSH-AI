@@ -44,11 +44,17 @@ async function startServer() {
 
   if (CLEANUP_INTERVAL_MS > 0 && process.env.DISABLE_AUDIO_CLEANUP_SCHEDULER !== 'true') {
     const timer = setInterval(() => {
-      void audioRetention.cleanupExpiredAudio({ limit: 50 }).catch((err) => {
-        logStructured('warn', 'scheduled_audio_cleanup_skipped', {
-          reason: sanitizeErrorMessage(err),
+      void audioRetention
+        .cleanupExpiredAudio({
+          limit: 50,
+          orphanPageSize: 500,
+          orphanMaxPagesPerRun: 4,
+        })
+        .catch((err) => {
+          logStructured('warn', 'scheduled_audio_cleanup_skipped', {
+            reason: sanitizeErrorMessage(err),
+          });
         });
-      });
     }, CLEANUP_INTERVAL_MS);
     timer.unref();
   }

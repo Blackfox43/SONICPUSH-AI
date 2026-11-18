@@ -355,6 +355,14 @@ test('Firestore Emulator Security Rules Suite (8 Scenarios)', async () => {
       createdAt: '2026-01-01T00:00:00.000Z',
       updatedAt: '2026-01-01T00:00:00.000Z',
     });
+    await setDoc(doc(db, 'audio_cleanup_cursors', 'orphan_cursor_all'), {
+      id: 'orphan_cursor_all',
+      organizationId: 'all',
+      nextPageToken: '',
+      lastScannedPath: '',
+      pagesScannedInCycle: 0,
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    });
   });
 
   await assertFails(
@@ -371,6 +379,14 @@ test('Firestore Emulator Security Rules Suite (8 Scenarios)', async () => {
   );
   await assertFails(getDoc(doc(promoterADb, 'audio_cleanup_queue', 'aq_test_1')));
   await assertSucceeds(getDoc(doc(promotedAdminDb, 'audio_cleanup_queue', 'aq_test_1')));
+  await assertFails(
+    setDoc(doc(promoterADb, 'audio_cleanup_cursors', 'forged_cursor'), {
+      id: 'forged_cursor',
+      organizationId: 'org_alpha',
+    })
+  );
+  await assertFails(getDoc(doc(promoterADb, 'audio_cleanup_cursors', 'orphan_cursor_all')));
+  await assertSucceeds(getDoc(doc(promotedAdminDb, 'audio_cleanup_cursors', 'orphan_cursor_all')));
 
   // 11. Song Phase 2 retention metadata validation
   await env.withSecurityRulesDisabled(async (ctx) => {
