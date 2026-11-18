@@ -81,6 +81,7 @@ export async function verifyPaystackWithProvider(params: {
   expectedAmountMinor: number;
   expectedCurrency: CurrencyCode;
   invoiceId: string;
+  expectedOrganizationId?: string;
   secretKey?: string;
   fetchImpl?: FetchLike;
 }): Promise<ProviderVerificationResult> {
@@ -119,7 +120,7 @@ export async function verifyPaystackWithProvider(params: {
       reference?: string;
       amount?: number;
       currency?: string;
-      metadata?: { invoiceId?: string };
+      metadata?: { invoiceId?: string; organizationId?: string };
     };
   };
 
@@ -149,7 +150,14 @@ export async function verifyPaystackWithProvider(params: {
     };
   }
 
-  const actualMinor = Math.round(Number(tx.amount ?? -1));
+  if (typeof tx.amount !== 'number' || !Number.isFinite(tx.amount)) {
+    return {
+      verified: false,
+      verificationStatus: 'failed',
+      message: 'Paystack returned missing or non-numeric transaction amount.',
+    };
+  }
+  const actualMinor = Math.round(tx.amount);
   if (actualMinor !== params.expectedAmountMinor) {
     return {
       verified: false,
@@ -159,11 +167,11 @@ export async function verifyPaystackWithProvider(params: {
   }
 
   const actualCurrency = String(tx.currency || '').toUpperCase();
-  if (actualCurrency !== params.expectedCurrency.toUpperCase()) {
+  if (!actualCurrency || actualCurrency !== params.expectedCurrency.toUpperCase()) {
     return {
       verified: false,
       verificationStatus: 'failed',
-      message: `Paystack currency mismatch (expected ${params.expectedCurrency}, got ${actualCurrency}).`,
+      message: `Paystack currency mismatch (expected ${params.expectedCurrency}, got ${actualCurrency || 'missing'}).`,
     };
   }
 
@@ -172,6 +180,18 @@ export async function verifyPaystackWithProvider(params: {
       verified: false,
       verificationStatus: 'failed',
       message: 'Paystack metadata invoiceId does not match target invoice.',
+    };
+  }
+
+  if (
+    params.expectedOrganizationId &&
+    tx.metadata?.organizationId &&
+    tx.metadata.organizationId !== params.expectedOrganizationId
+  ) {
+    return {
+      verified: false,
+      verificationStatus: 'failed',
+      message: 'Paystack metadata organizationId does not match invoice organization.',
     };
   }
 
@@ -191,6 +211,7 @@ export async function verifyFlutterwaveWithProvider(params: {
   expectedAmountMinor: number;
   expectedCurrency: CurrencyCode;
   invoiceId: string;
+  expectedOrganizationId?: string;
   secretKey?: string;
   fetchImpl?: FetchLike;
 }): Promise<ProviderVerificationResult> {
@@ -230,7 +251,7 @@ export async function verifyFlutterwaveWithProvider(params: {
       tx_ref?: string;
       amount?: number;
       currency?: string;
-      meta?: { invoiceId?: string };
+      meta?: { invoiceId?: string; organizationId?: string };
     };
   };
 
@@ -268,7 +289,14 @@ export async function verifyFlutterwaveWithProvider(params: {
     };
   }
 
-  const actualMinor = Math.round(Number(tx.amount ?? -1) * 100);
+  if (typeof tx.amount !== 'number' || !Number.isFinite(tx.amount)) {
+    return {
+      verified: false,
+      verificationStatus: 'failed',
+      message: 'Flutterwave returned missing or non-numeric transaction amount.',
+    };
+  }
+  const actualMinor = Math.round(tx.amount * 100);
   if (actualMinor !== params.expectedAmountMinor) {
     return {
       verified: false,
@@ -278,11 +306,11 @@ export async function verifyFlutterwaveWithProvider(params: {
   }
 
   const actualCurrency = String(tx.currency || '').toUpperCase();
-  if (actualCurrency !== params.expectedCurrency.toUpperCase()) {
+  if (!actualCurrency || actualCurrency !== params.expectedCurrency.toUpperCase()) {
     return {
       verified: false,
       verificationStatus: 'failed',
-      message: `Flutterwave currency mismatch (expected ${params.expectedCurrency}, got ${actualCurrency}).`,
+      message: `Flutterwave currency mismatch (expected ${params.expectedCurrency}, got ${actualCurrency || 'missing'}).`,
     };
   }
 
@@ -291,6 +319,18 @@ export async function verifyFlutterwaveWithProvider(params: {
       verified: false,
       verificationStatus: 'failed',
       message: 'Flutterwave metadata invoiceId does not match target invoice.',
+    };
+  }
+
+  if (
+    params.expectedOrganizationId &&
+    tx.meta?.organizationId &&
+    tx.meta.organizationId !== params.expectedOrganizationId
+  ) {
+    return {
+      verified: false,
+      verificationStatus: 'failed',
+      message: 'Flutterwave metadata organizationId does not match invoice organization.',
     };
   }
 
@@ -309,6 +349,7 @@ export async function verifyStripeWithProvider(params: {
   expectedAmountMinor: number;
   expectedCurrency: CurrencyCode;
   invoiceId: string;
+  expectedOrganizationId?: string;
   secretKey?: string;
   stripeClient?: Stripe;
 }): Promise<ProviderVerificationResult> {
@@ -334,7 +375,7 @@ export async function verifyStripeWithProvider(params: {
         message: `Stripe Checkout session status is "${session.payment_status}", not paid.`,
       };
     }
-    const actualMinor = session.amount_total ?? -1;
+    const actualMinor = typeof session.amount_total === 'number' ? session.amount_total : -1;
     if (actualMinor !== params.expectedAmountMinor) {
       return {
         verified: false,
@@ -343,11 +384,11 @@ export async function verifyStripeWithProvider(params: {
       };
     }
     const actualCurrency = String(session.currency || '').toUpperCase();
-    if (actualCurrency !== params.expectedCurrency.toUpperCase()) {
+    if (!actualCurrency || actualCurrency !== params.expectedCurrency.toUpperCase()) {
       return {
         verified: false,
         verificationStatus: 'failed',
-        message: `Stripe currency mismatch (expected ${params.expectedCurrency}, got ${actualCurrency}).`,
+        message: `Stripe currency mismatch (expected ${params.expectedCurrency}, got ${actualCurrency || 'missing'}).`,
       };
     }
     if (session.metadata?.invoiceId && session.metadata.invoiceId !== params.invoiceId) {
@@ -355,6 +396,17 @@ export async function verifyStripeWithProvider(params: {
         verified: false,
         verificationStatus: 'failed',
         message: 'Stripe session metadata invoiceId mismatch.',
+      };
+    }
+    if (
+      params.expectedOrganizationId &&
+      session.metadata?.organizationId &&
+      session.metadata.organizationId !== params.expectedOrganizationId
+    ) {
+      return {
+        verified: false,
+        verificationStatus: 'failed',
+        message: 'Stripe session metadata organizationId mismatch.',
       };
     }
     return {
@@ -378,7 +430,7 @@ export async function verifyStripeWithProvider(params: {
         message: `Stripe PaymentIntent status is "${pi.status}", not succeeded.`,
       };
     }
-    const actualMinor = pi.amount_received ?? -1;
+    const actualMinor = typeof pi.amount_received === 'number' ? pi.amount_received : -1;
     if (actualMinor !== params.expectedAmountMinor) {
       return {
         verified: false,
@@ -387,11 +439,11 @@ export async function verifyStripeWithProvider(params: {
       };
     }
     const actualCurrency = String(pi.currency || '').toUpperCase();
-    if (actualCurrency !== params.expectedCurrency.toUpperCase()) {
+    if (!actualCurrency || actualCurrency !== params.expectedCurrency.toUpperCase()) {
       return {
         verified: false,
         verificationStatus: 'failed',
-        message: `Stripe currency mismatch (expected ${params.expectedCurrency}, got ${actualCurrency}).`,
+        message: `Stripe currency mismatch (expected ${params.expectedCurrency}, got ${actualCurrency || 'missing'}).`,
       };
     }
     if (pi.metadata?.invoiceId && pi.metadata.invoiceId !== params.invoiceId) {
@@ -399,6 +451,17 @@ export async function verifyStripeWithProvider(params: {
         verified: false,
         verificationStatus: 'failed',
         message: 'Stripe PaymentIntent metadata invoiceId mismatch.',
+      };
+    }
+    if (
+      params.expectedOrganizationId &&
+      pi.metadata?.organizationId &&
+      pi.metadata.organizationId !== params.expectedOrganizationId
+    ) {
+      return {
+        verified: false,
+        verificationStatus: 'failed',
+        message: 'Stripe PaymentIntent metadata organizationId mismatch.',
       };
     }
     return {
@@ -489,8 +552,23 @@ export function normalizePaystackWebhookPayload(
   const metadata = (
     data.metadata && typeof data.metadata === 'object' ? data.metadata : {}
   ) as Record<string, unknown>;
-  const reference = typeof data.reference === 'string' ? data.reference : '';
-  const txId = data.id !== undefined ? String(data.id) : '';
+  const nestedTx = (
+    data.transaction && typeof data.transaction === 'object' ? data.transaction : {}
+  ) as Record<string, unknown>;
+  const reference =
+    typeof data.reference === 'string' && data.reference
+      ? data.reference
+      : typeof data.transaction_reference === 'string' && data.transaction_reference
+      ? data.transaction_reference
+      : typeof nestedTx.reference === 'string'
+      ? nestedTx.reference
+      : '';
+  const txId =
+    data.id !== undefined
+      ? String(data.id)
+      : nestedTx.id !== undefined
+      ? String(nestedTx.id)
+      : '';
   const eventId = txId ? `${event}:${txId}` : `${event}:${reference}`;
   if (!event || !reference) return null;
 
@@ -506,7 +584,10 @@ export function normalizePaystackWebhookPayload(
     reference,
     providerTransactionId: txId || undefined,
     outcome,
-    amountMinor: typeof data.amount === 'number' ? Math.round(data.amount) : undefined,
+    amountMinor:
+      typeof data.amount === 'number' && Number.isFinite(data.amount)
+        ? Math.round(data.amount)
+        : undefined,
     currency: typeof data.currency === 'string' ? data.currency.toUpperCase() : undefined,
     invoiceId: typeof metadata.invoiceId === 'string' ? metadata.invoiceId : undefined,
     organizationId:
@@ -525,7 +606,12 @@ export function normalizeFlutterwaveWebhookPayload(
   const meta = (
     data.meta && typeof data.meta === 'object' ? data.meta : {}
   ) as Record<string, unknown>;
-  const reference = typeof data.tx_ref === 'string' ? data.tx_ref : '';
+  const reference =
+    typeof data.tx_ref === 'string' && data.tx_ref
+      ? data.tx_ref
+      : typeof data.txRef === 'string'
+      ? data.txRef
+      : '';
   const txId = data.id !== undefined ? String(data.id) : '';
   const eventId = txId ? `${event}:${txId}` : `${event}:${reference}`;
   if (!event || !reference) return null;
@@ -542,7 +628,10 @@ export function normalizeFlutterwaveWebhookPayload(
     reference,
     providerTransactionId: txId || undefined,
     outcome,
-    amountMinor: typeof data.amount === 'number' ? Math.round(data.amount * 100) : undefined,
+    amountMinor:
+      typeof data.amount === 'number' && Number.isFinite(data.amount)
+        ? Math.round(data.amount * 100)
+        : undefined,
     currency: typeof data.currency === 'string' ? data.currency.toUpperCase() : undefined,
     invoiceId: typeof meta.invoiceId === 'string' ? meta.invoiceId : undefined,
     organizationId: typeof meta.organizationId === 'string' ? meta.organizationId : undefined,
@@ -579,19 +668,26 @@ export function normalizeStripeWebhookEvent(event: Stripe.Event): NormalizedWebh
   }
 
   const amountVal =
-    typeof obj.amount_received === 'number'
+    typeof obj.amount_received === 'number' && Number.isFinite(obj.amount_received)
       ? obj.amount_received
-      : typeof obj.amount_total === 'number'
+      : typeof obj.amount_total === 'number' && Number.isFinite(obj.amount_total)
       ? obj.amount_total
-      : typeof obj.amount === 'number'
+      : typeof obj.amount === 'number' && Number.isFinite(obj.amount)
       ? obj.amount
+      : undefined;
+
+  const providerTxId =
+    typeof obj.payment_intent === 'string'
+      ? obj.payment_intent
+      : typeof obj.id === 'string'
+      ? obj.id
       : undefined;
 
   return {
     eventId: event.id,
     eventType: event.type,
     reference,
-    providerTransactionId: typeof obj.id === 'string' ? obj.id : undefined,
+    providerTransactionId: providerTxId,
     outcome,
     amountMinor: amountVal,
     currency: typeof obj.currency === 'string' ? obj.currency.toUpperCase() : undefined,

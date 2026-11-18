@@ -3,7 +3,7 @@ import { Upload, Sparkles, CheckCircle2, AlertCircle, Trash2, Music2, Volume2 } 
 import { useWorkspace } from '../../context/WorkspaceContext';
 import { useToast } from '../ToastProvider';
 import { deleteJsonApi, fetchAuthorizedBlob, getJsonApi, postFormApi } from '../../lib/api';
-import { clampStr, createScopedDoc, deleteScopedDoc, makeDocId } from '../../lib/firebase';
+import { clampStr, createScopedDoc, makeDocId } from '../../lib/firebase';
 import type { Song, SongIntelligenceResult } from '../../types/sonicpush';
 
 export const SongIntelligenceView: React.FC = () => {
@@ -150,10 +150,13 @@ export const SongIntelligenceView: React.FC = () => {
 
   const handleDeleteSong = async (song: Song) => {
     try {
-      try {
-        await deleteJsonApi(`/api/songs/${encodeURIComponent(song.id)}`);
-      } catch {
-        await deleteScopedDoc('songs', song.id);
+      const result = await deleteJsonApi<{
+        ok?: boolean;
+        deleted?: boolean;
+        error?: string;
+      }>(`/api/songs/${encodeURIComponent(song.id)}`);
+      if (result.ok === false || result.deleted === false) {
+        throw new Error(result.error || 'Server did not confirm song deletion.');
       }
       if (selectedSong?.id === song.id) {
         setSelectedSong(null);

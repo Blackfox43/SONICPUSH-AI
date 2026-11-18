@@ -343,12 +343,34 @@ test('Firestore Emulator Security Rules Suite (8 Scenarios)', async () => {
   );
   await assertFails(getDoc(doc(promoterADb, 'payment_webhook_events', 'paystack_evt_1')));
   await assertFails(getDoc(doc(promotedAdminDb, 'ai_rate_limits', 'forged_rl')));
+  await env.withSecurityRulesDisabled(async (ctx) => {
+    const db = ctx.firestore();
+    await setDoc(doc(db, 'audio_cleanup_queue', 'aq_test_1'), {
+      id: 'aq_test_1',
+      organizationId: 'org_alpha',
+      storageObjectPath: 'organizations/org_alpha/audio/1234.mp3',
+      reason: 'song_delete_failed',
+      status: 'pending',
+      retryCount: 1,
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    });
+  });
+
   await assertFails(
     setDoc(doc(promoterADb, 'audio_cleanup_logs', 'forged_clean'), {
       id: 'forged_clean',
       status: 'deleted',
     })
   );
+  await assertFails(
+    setDoc(doc(promoterADb, 'audio_cleanup_queue', 'forged_queue'), {
+      id: 'forged_queue',
+      status: 'pending',
+    })
+  );
+  await assertFails(getDoc(doc(promoterADb, 'audio_cleanup_queue', 'aq_test_1')));
+  await assertSucceeds(getDoc(doc(promotedAdminDb, 'audio_cleanup_queue', 'aq_test_1')));
 
   // 11. Song Phase 2 retention metadata validation
   await env.withSecurityRulesDisabled(async (ctx) => {

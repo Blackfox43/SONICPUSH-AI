@@ -68,6 +68,7 @@ interface AdminDiagnosticsResponse {
   };
   audioCleanup: {
     failedSongsCount: number;
+    pendingQueueCount?: number;
     recentLogs: Array<{
       id: string;
       songId: string;
@@ -488,8 +489,10 @@ export const PaymentsAdminView: React.FC<{ initialTab?: 'payments' | 'admin' }> 
                 </button>
               </div>
               <p className="text-xs text-zinc-400">
-                Deletes expired private audio files past <code className="font-mono-tabular">AUDIO_RETENTION_DAYS</code> and retries failed deletions.
-                {diagnostics ? ` Failed pending retry: ${diagnostics.audioCleanup.failedSongsCount}.` : ''}
+                Deletes expired private audio files past <code className="font-mono-tabular">AUDIO_RETENTION_DAYS</code>, retries failed deletions, and reconciles orphaned Storage objects.
+                {diagnostics
+                  ? ` Failed songs: ${diagnostics.audioCleanup.failedSongsCount} · Cleanup queue: ${diagnostics.audioCleanup.pendingQueueCount ?? 0}.`
+                  : ''}
               </p>
               {diagnostics && diagnostics.audioCleanup.recentLogs.length > 0 ? (
                 <div className="space-y-1.5 max-h-28 overflow-y-auto text-[11px]">

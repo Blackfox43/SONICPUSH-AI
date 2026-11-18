@@ -7,39 +7,25 @@ service firebase.storage {
       allow read, write: if false;
     }
 
-    // Private organization-scoped audio assets only (never public by default)
+    // Private organization-scoped audio assets:
+    // All uploads, updates, and deletions are executed exclusively by the server-side Firebase Admin SDK.
+    // Direct client writes/deletes are unconditionally denied and client-supplied metadata is never trusted.
     match /organizations/{orgId}/audio/{fileName} {
       allow read: if request.auth != null &&
                      request.auth.token.email_verified == true &&
                      orgId.matches('^[a-zA-Z0-9_\\-]+$') &&
                      fileName.matches('^[a-zA-Z0-9._\\-]+$') &&
                      (
-                       (resource != null && resource.metadata != null && resource.metadata.ownerId == request.auth.uid && resource.metadata.organizationId == orgId) ||
                        request.auth.token.superAdmin == true ||
                        request.auth.token.role == 'SUPER_ADMIN' ||
-                       request.auth.token.email == 'emma432cent@gmail.com'
+                       request.auth.token.email == 'emma432cent@gmail.com' ||
+                       (
+                         request.auth.token.organizationId is string &&
+                         request.auth.token.organizationId == orgId
+                       )
                      );
 
-      allow create: if request.auth != null &&
-                       request.auth.token.email_verified == true &&
-                       orgId.matches('^[a-zA-Z0-9_\\-]+$') &&
-                       fileName.matches('^[a-fA-F0-9\\-]+\\.(mp3|wav|m4a|aac|ogg|flac|webm)$') &&
-                       request.resource != null &&
-                       request.resource.size > 0 &&
-                       request.resource.size <= 20 * 1024 * 1024 &&
-                       request.resource.contentType.matches('audio/.*') &&
-                       request.resource.metadata != null &&
-                       request.resource.metadata.ownerId == request.auth.uid &&
-                       request.resource.metadata.organizationId == orgId;
-
-      allow delete: if request.auth != null &&
-                       request.auth.token.email_verified == true &&
-                       (
-                         (resource != null && resource.metadata != null && resource.metadata.ownerId == request.auth.uid) ||
-                         request.auth.token.superAdmin == true ||
-                         request.auth.token.role == 'SUPER_ADMIN' ||
-                         request.auth.token.email == 'emma432cent@gmail.com'
-                       );
+      allow create, update, delete: if false;
     }
   }
 }

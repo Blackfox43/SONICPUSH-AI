@@ -110,15 +110,23 @@ function createInMemoryAdminFirestore(
             throw new Error('SIMULATED_FIRESTORE_TRANSIENT_ERROR');
           }
           // Stage writes until transaction callback succeeds cleanly (atomic rollback on throw)
+          // Strictly enforce real Firestore rule: all reads must execute before any writes!
           const snapshotCols = cloneValue(docs);
           const stagedOps: Array<() => void> = [];
+          let hasWrittenInTx = false;
 
           const tx: AdminTx = {
             async get(col, id) {
+              if (hasWrittenInTx) {
+                throw new Error(
+                  'Firestore transactions require all reads to be executed before all writes.'
+                );
+              }
               const hit = snapshotCols[col]?.[id];
               return hit ? cloneValue(hit) : null;
             },
             async set(col, id, data, merge = false) {
+              hasWrittenInTx = true;
               snapshotCols[col] = snapshotCols[col] || {};
               const clean = cloneValue(data);
               snapshotCols[col][id] =
@@ -131,6 +139,7 @@ function createInMemoryAdminFirestore(
               });
             },
             async update(col, id, data) {
+              hasWrittenInTx = true;
               if (!snapshotCols[col]?.[id]) {
                 throw new Error(`NOT_FOUND:${col}/${id}`);
               }
@@ -159,7 +168,13 @@ function createInMemoryAdminFirestore(
 function createInMemoryAudioStorage() {
   const objects = new Map<
     string,
-    { buffer: Buffer; contentType: string; ownerId: string; organizationId: string }
+    {
+      buffer: Buffer;
+      contentType: string;
+      ownerId: string;
+      organizationId: string;
+      uploadedAt: string;
+    }
   >();
   let failNextUpload = false;
   const failDeletePaths = new Set<string>();
@@ -175,6 +190,7 @@ function createInMemoryAudioStorage() {
         contentType: params.contentType,
         ownerId: params.ownerId,
         organizationId: params.organizationId,
+        uploadedAt: params.uploadedAt || new Date().toISOString(),
       });
     },
     async deleteAudioObject(storageObjectPath) {
@@ -194,6 +210,20 @@ function createInMemoryAudioStorage() {
       if (!hit) throw new Error('OBJECT_NOT_FOUND');
       return { buffer: Buffer.from(hit.buffer), contentType: hit.contentType };
     },
+    async listAudioObjects(prefix = 'organizations/') {
+      const out = [];
+      for (const [path, entry] of objects.entries()) {
+        if (path.startsWith(prefix)) {
+          out.push({
+            path,
+            organizationId: entry.organizationId,
+            uploadedAt: entry.uploadedAt,
+            updatedAt: entry.uploadedAt,
+          });
+        }
+      }
+      return out;
+    },
   };
 
   return {
@@ -206,6 +236,24 @@ function createInMemoryAudioStorage() {
       if (shouldFail) failDeletePaths.add(path);
       else failDeletePaths.delete(path);
     },
+    seedObject(
+      path: string,
+      entry: {
+        buffer?: Buffer;
+        contentType?: string;
+        ownerId?: string;
+        organizationId: string;
+        uploadedAt: string;
+      }
+    ) {
+      objects.set(path, {
+        buffer: entry.buffer ?? Buffer.from('ID3'),
+        contentType: entry.contentType ?? 'audio/mpeg',
+        ownerId: entry.ownerId ?? 'uid_seed',
+        organizationId: entry.organizationId,
+        uploadedAt: entry.uploadedAt,
+      });
+    },
   };
 }
 
@@ -215,6 +263,7 @@ function buildTestEnvironment(overrides?: {
   fetchImpl?: typeof fetch;
   stripeClient?: Stripe;
   onGeminiPrompt?: (text: string) => void;
+  failGeminiError?: Error;
   audioStorage?: ReturnType<typeof createInMemoryAudioStorage>;
 }) {
   const dbController =
@@ -345,6 +394,9 @@ function buildTestEnvironment(overrides?: {
           overrides.onGeminiPrompt(
             JSON.stringify({ contents: args.contents, systemInstruction: args.config?.systemInstruction })
           );
+        }
+        if (overrides?.failGeminiError) {
+          throw overrides.failGeminiError;
         }
         return {
           text: JSON.stringify({
@@ -534,7 +586,11 @@ test('2. Super Admin Governance: role escalation blocked, bootstrap owner & self
     assert.equal(promoteBody.ok, true);
     assert.equal(promoteBody.role, 'SUPER_ADMIN');
     assert.equal(promoteBody.claimsSynced, true);
-    assert.deepEqual(syncedClaims.uid_art_b, { superAdmin: true, role: 'SUPER_ADMIN' });
+    assert.deepEqual(syncedClaims.uid_art_b, {
+      superAdmin: true,
+      role: 'SUPER_ADMIN',
+      organizationId: 'org_b',
+    });
 
     const auditLogs = Object.values(dbController.docs.admin_audit_logs || {});
     assert.equal(auditLogs.length, 1);
@@ -1509,3 +1565,529 @@ test('6. Distributed Firestore AI Quotas: per-user, per-org, per-feature limits,
     assert.equal(usageSerialized.includes('promoter-a@example.com'), false);
   });
 });
+
+test('7. Payment Regression: strict tx ordering with/without existing payment docs, Stripe cs_->pi_ & Paystack dispute/refund, incomplete webhooks & transient retry', async () => {
+  const prevPaystack = process.env.PAYSTACK_SECRET_KEY;
+  const prevStripeKey = process.env.STRIPE_SECRET_KEY;
+  const prevStripeWebhook = process.env.STRIPE_WEBHOOK_SECRET;
+
+  process.env.PAYSTACK_SECRET_KEY = 'sk_test_paystack_reg';
+  process.env.STRIPE_SECRET_KEY = 'sk_test_stripe_reg';
+  process.env.STRIPE_WEBHOOK_SECRET = 'whsec_stripe_reg';
+
+  try {
+    const dbCtrl = createInMemoryAdminFirestore({
+      users: {
+        uid_admin: {
+          uid: 'uid_admin',
+          email: 'emma432cent@gmail.com',
+          role: 'SUPER_ADMIN',
+          organizationId: 'org_agency',
+        },
+        uid_prom_a: {
+          uid: 'uid_prom_a',
+          email: 'promoter-a@example.com',
+          role: 'PROMOTER',
+          organizationId: 'org_a',
+        },
+      },
+      invoices: {
+        inv_with_pm: {
+          id: 'inv_with_pm',
+          organizationId: 'org_a',
+          ownerId: 'uid_prom_a',
+          assignedUserIds: ['uid_prom_a'],
+          clientName: 'With Payment Doc',
+          currency: 'NGN',
+          amount: 25000,
+          status: 'awaiting_verification',
+        },
+        inv_no_pm: {
+          id: 'inv_no_pm',
+          organizationId: 'org_a',
+          ownerId: 'uid_prom_a',
+          assignedUserIds: ['uid_prom_a'],
+          clientName: 'Without Payment Doc',
+          currency: 'NGN',
+          amount: 40000,
+          status: 'sent',
+        },
+        inv_stripe_cs: {
+          id: 'inv_stripe_cs',
+          organizationId: 'org_a',
+          ownerId: 'uid_prom_a',
+          assignedUserIds: ['uid_prom_a'],
+          clientName: 'Stripe Checkout Session',
+          currency: 'USD',
+          amount: 120,
+          status: 'sent',
+        },
+      },
+      payments: {
+        pay_existing_1: {
+          id: 'pay_existing_1',
+          organizationId: 'org_a',
+          ownerId: 'uid_prom_a',
+          assignedUserIds: ['uid_prom_a'],
+          invoiceId: 'inv_with_pm',
+          provider: 'paystack',
+          reference: 'PSK_WITH_PM_1',
+          currency: 'NGN',
+          amount: 25000,
+          verificationStatus: 'pending',
+        },
+      },
+    });
+
+    const gatewayFetch = async (url: string) => {
+      if (url.includes('PSK_WITH_PM_1')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            status: true,
+            data: {
+              id: 801,
+              status: 'success',
+              reference: 'PSK_WITH_PM_1',
+              amount: 2500000,
+              currency: 'NGN',
+              metadata: { invoiceId: 'inv_with_pm', organizationId: 'org_a' },
+            },
+          }),
+        };
+      }
+      if (url.includes('PSK_NO_PM_1')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            status: true,
+            data: {
+              id: 802,
+              status: 'success',
+              reference: 'PSK_NO_PM_1',
+              amount: 4000000,
+              currency: 'NGN',
+              metadata: { invoiceId: 'inv_no_pm', organizationId: 'org_a' },
+            },
+          }),
+        };
+      }
+      return { ok: false, status: 404, json: async () => ({}) };
+    };
+
+    const mockStripeClient = {
+      checkout: {
+        sessions: {
+          retrieve: async (id: string) => ({
+            id,
+            payment_status: 'paid',
+            payment_intent: 'pi_linked_cs_1',
+            amount_total: 12000,
+            currency: 'usd',
+            metadata: { invoiceId: 'inv_stripe_cs', organizationId: 'org_a' },
+          }),
+        },
+      },
+      paymentIntents: {
+        retrieve: async (id: string) => ({
+          id,
+          status: 'succeeded',
+          amount_received: 12000,
+          currency: 'usd',
+          metadata: { invoiceId: 'inv_stripe_cs', organizationId: 'org_a' },
+        }),
+      },
+    } as unknown as Stripe;
+
+    const { app } = buildTestEnvironment({
+      dbController: dbCtrl,
+      fetchImpl: gatewayFetch as unknown as typeof fetch,
+      stripeClient: mockStripeClient,
+    });
+
+    const signPaystack = (raw: string) =>
+      crypto.createHmac('sha512', 'sk_test_paystack_reg').update(Buffer.from(raw, 'utf8')).digest('hex');
+
+    await withLiveServer(app, async (baseUrl) => {
+      // 7a. Super Admin /verify + /reconcile on invoice WITH existing payment doc (catches any read-after-write!)
+      const verifyWithPm = await fetch(`${baseUrl}/api/payments/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token-admin' },
+        body: JSON.stringify({
+          invoiceId: 'inv_with_pm',
+          provider: 'paystack',
+          reference: 'PSK_WITH_PM_1',
+        }),
+      });
+      assert.equal(verifyWithPm.status, 200);
+      assert.equal(dbCtrl.docs.invoices.inv_with_pm.status, 'paid');
+
+      const reconcileWithPm = await fetch(`${baseUrl}/api/payments/reconcile`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token-admin' },
+        body: JSON.stringify({
+          invoiceId: 'inv_with_pm',
+          paymentId: 'pay_existing_1',
+          provider: 'paystack',
+          reference: 'PSK_WITH_PM_1',
+        }),
+      });
+      assert.equal(reconcileWithPm.status, 200);
+      assert.equal(dbCtrl.docs.payments.pay_existing_1.verificationStatus, 'verified');
+
+      // 7b. Reconcile on invoice WITHOUT existing payment doc succeeds cleanly
+      const verifyNoPm = await fetch(`${baseUrl}/api/payments/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token-promoter-a' },
+        body: JSON.stringify({
+          invoiceId: 'inv_no_pm',
+          provider: 'paystack',
+          reference: 'PSK_NO_PM_1',
+        }),
+      });
+      assert.equal(verifyNoPm.status, 200);
+      const reconcileNoPm = await fetch(`${baseUrl}/api/payments/reconcile`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token-admin' },
+        body: JSON.stringify({
+          invoiceId: 'inv_no_pm',
+          provider: 'paystack',
+          reference: 'PSK_NO_PM_1',
+        }),
+      });
+      assert.equal(reconcileNoPm.status, 200);
+      assert.equal(dbCtrl.docs.invoices.inv_no_pm.status, 'paid');
+
+      // 7c. Incomplete verified webhook (missing amount/currency) is quarantined safely
+      const incompletePayload = JSON.stringify({
+        event: 'charge.success',
+        data: {
+          id: 'evt_incomplete_1',
+          status: 'success',
+          reference: 'PSK_NO_PM_1',
+          metadata: { invoiceId: 'inv_no_pm' },
+        },
+      });
+      const incompleteRes = await fetch(`${baseUrl}/api/payments/webhook/paystack`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-paystack-signature': signPaystack(incompletePayload) },
+        body: incompletePayload,
+      });
+      assert.equal(incompleteRes.status, 200);
+      const incompleteBody = (await incompleteRes.json()) as { quarantined: boolean };
+      assert.equal(incompleteBody.quarantined, true);
+
+      // 7d. Paystack dispute event (using nested data.transaction.reference) updates existing payment & invoice
+      const disputePayload = JSON.stringify({
+        event: 'charge.dispute.create',
+        data: {
+          id: 'disp_1',
+          currency: 'NGN',
+          amount: 2500000,
+          transaction: { reference: 'PSK_WITH_PM_1' },
+        },
+      });
+      const disputeRes = await fetch(`${baseUrl}/api/payments/webhook/paystack`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-paystack-signature': signPaystack(disputePayload) },
+        body: disputePayload,
+      });
+      assert.equal(disputeRes.status, 200);
+      const disputeBody = (await disputeRes.json()) as { outcome: string; reconciliationStatus: string };
+      assert.equal(disputeBody.outcome, 'disputed');
+      assert.equal(disputeBody.reconciliationStatus, 'reconciled');
+      assert.equal(dbCtrl.docs.invoices.inv_with_pm.status, 'disputed');
+      assert.equal(dbCtrl.docs.payments.pay_existing_1.verificationStatus, 'disputed');
+
+      // 7e. Paystack refund event (using data.transaction_reference) on invoice WITHOUT prior payment creates canonical payment doc cleanly
+      const refundPayload = JSON.stringify({
+        event: 'refund.processed',
+        data: {
+          id: 'ref_1',
+          transaction_reference: 'PSK_NO_PM_1',
+          currency: 'NGN',
+          amount: 4000000,
+        },
+      });
+      const refundRes = await fetch(`${baseUrl}/api/payments/webhook/paystack`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-paystack-signature': signPaystack(refundPayload) },
+        body: refundPayload,
+      });
+      assert.equal(refundRes.status, 200);
+      assert.equal(dbCtrl.docs.invoices.inv_no_pm.status, 'refunded');
+      assert.ok(Object.values(dbCtrl.docs.payments).some((p) => p.invoiceId === 'inv_no_pm' && p.verificationStatus === 'refunded'));
+
+      // 7f. Failed webhook after transient Firestore tx error transitions awaiting_verification -> sent cleanly on retry
+      await dbCtrl.adapter.setDoc('invoices', 'inv_fail_test', {
+        id: 'inv_fail_test',
+        organizationId: 'org_a',
+        ownerId: 'uid_prom_a',
+        assignedUserIds: ['uid_prom_a'],
+        clientName: 'Fail Retry Test',
+        currency: 'NGN',
+        amount: 10000,
+        status: 'awaiting_verification',
+      });
+      const failWhPayload = JSON.stringify({
+        event: 'charge.failed',
+        data: {
+          id: 'fail_wh_1',
+          status: 'failed',
+          reference: 'PSK_FAIL_RETRY_1',
+          gateway_response: 'Insufficient funds',
+          metadata: { invoiceId: 'inv_fail_test', organizationId: 'org_a' },
+        },
+      });
+      dbCtrl.failNextTransactionCount = 1;
+      const failWh1 = await fetch(`${baseUrl}/api/payments/webhook/paystack`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-paystack-signature': signPaystack(failWhPayload) },
+        body: failWhPayload,
+      });
+      assert.equal(failWh1.status, 500);
+      const failWh1Body = (await failWh1.json()) as { eventDocId: string; retryable: boolean };
+      assert.equal(failWh1Body.retryable, true);
+
+      const failRetry = await fetch(`${baseUrl}/api/payments/webhooks/${failWh1Body.eventDocId}/retry`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token-admin' },
+      });
+      assert.equal(failRetry.status, 200);
+      assert.equal(dbCtrl.docs.invoices.inv_fail_test.status, 'sent');
+
+      // 7g. Stripe Checkout Session cs_ -> PaymentIntent pi_ correlation across webhook lifecycle
+      const verifyCs = await fetch(`${baseUrl}/api/payments/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token-promoter-a' },
+        body: JSON.stringify({
+          invoiceId: 'inv_stripe_cs',
+          provider: 'stripe',
+          reference: 'cs_test_session_1',
+        }),
+      });
+      assert.equal(verifyCs.status, 200);
+
+      const stripe = new Stripe('sk_test_dummy');
+      const stripeRefundPayload = JSON.stringify({
+        id: 'evt_cs_refund_1',
+        object: 'event',
+        type: 'charge.refunded',
+        data: {
+          object: {
+            id: 'ch_cs_1',
+            payment_intent: 'pi_linked_cs_1',
+            amount: 12000,
+            currency: 'usd',
+          },
+        },
+      });
+      const stripeSig = stripe.webhooks.generateTestHeaderString({
+        payload: stripeRefundPayload,
+        secret: 'whsec_stripe_reg',
+      });
+      const stripeCsRefund = await fetch(`${baseUrl}/api/payments/webhook/stripe`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'stripe-signature': stripeSig },
+        body: stripeRefundPayload,
+      });
+      assert.equal(stripeCsRefund.status, 200);
+      assert.equal(dbCtrl.docs.invoices.inv_stripe_cs.status, 'refunded');
+    });
+  } finally {
+    if (prevPaystack === undefined) delete process.env.PAYSTACK_SECRET_KEY;
+    else process.env.PAYSTACK_SECRET_KEY = prevPaystack;
+    if (prevStripeKey === undefined) delete process.env.STRIPE_SECRET_KEY;
+    else process.env.STRIPE_SECRET_KEY = prevStripeKey;
+    if (prevStripeWebhook === undefined) delete process.env.STRIPE_WEBHOOK_SECRET;
+    else process.env.STRIPE_WEBHOOK_SECRET = prevStripeWebhook;
+  }
+});
+
+test('8. Phase 2.1 Audio Integrity: Gemini failure rollback & queue retry, Song delete preserves DB on Storage failure, and org-safe orphan reconciliation', async () => {
+  const mp3Header = Buffer.concat([Buffer.from('ID3\x03\x00\x00\x00\x00\x00\x00'), Buffer.alloc(16)]);
+
+  // 8a. Gemini failure after audio upload rolls back uploaded Storage object immediately (never leaves orphan)
+  const storageRollback = createInMemoryAudioStorage();
+  const envRollback = buildTestEnvironment({
+    audioStorage: storageRollback,
+    failGeminiError: new Error('GEMINI_UPSTREAM_TIMEOUT'),
+  });
+
+  await withLiveServer(envRollback.app, async (baseUrl) => {
+    const form = new FormData();
+    form.append('title', 'Gemini Fail Track');
+    form.append('organizationId', 'org_a');
+    form.append('audio', new Blob([mp3Header], { type: 'audio/mpeg' }), 'fail_track.mp3');
+
+    const res = await fetch(`${baseUrl}/api/ai/song-intelligence`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer token-promoter-a' },
+      body: form,
+    });
+    assert.equal(res.status, 500);
+    const body = (await res.json()) as {
+      audioProcessed: boolean;
+      audioUploaded: boolean;
+      cleanupQueued: boolean;
+    };
+    assert.equal(body.audioProcessed, false);
+    assert.equal(body.audioUploaded, false);
+    assert.equal(body.cleanupQueued, false);
+    assert.equal(storageRollback.objects.size, 0);
+    const logs = Object.values(envRollback.dbController.docs.audio_cleanup_logs || {});
+    assert.equal(logs.length, 1);
+    assert.equal(logs[0].status, 'deleted');
+    assert.equal(logs[0].reason, 'gemini_analysis_failed');
+  });
+
+  // 8b. Gemini failure when Storage rollback ALSO fails -> queues durable cleanup retry & cleans up on next run
+  const storageQueueFail = createInMemoryAudioStorage();
+  const baseUpload = storageQueueFail.adapter.uploadPrivateAudio.bind(storageQueueFail.adapter);
+  storageQueueFail.adapter.uploadPrivateAudio = async (params) => {
+    await baseUpload(params);
+    storageQueueFail.failDeleteFor(params.storageObjectPath, true);
+  };
+  const envGeminiQueue = buildTestEnvironment({
+    audioStorage: storageQueueFail,
+    failGeminiError: new Error('GEMINI_UNAVAILABLE'),
+  });
+
+  await withLiveServer(envGeminiQueue.app, async (baseUrl) => {
+    const form = new FormData();
+    form.append('title', 'Gemini And Delete Fail');
+    form.append('organizationId', 'org_a');
+    form.append('audio', new Blob([mp3Header], { type: 'audio/mpeg' }), 'double_fail.mp3');
+
+    const res = await fetch(`${baseUrl}/api/ai/song-intelligence`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer token-promoter-a' },
+      body: form,
+    });
+    assert.equal(res.status, 500);
+    const body = (await res.json()) as { cleanupQueued: boolean };
+    assert.equal(body.cleanupQueued, true);
+    assert.equal(storageQueueFail.objects.size, 1);
+    const queuedItems = Object.values(envGeminiQueue.dbController.docs.audio_cleanup_queue || {});
+    assert.equal(queuedItems.length, 1);
+    assert.equal(queuedItems[0].reason, 'gemini_analysis_failed');
+    const uploadedPath = String(queuedItems[0].storageObjectPath);
+
+    // Recover Storage and trigger retention cleanup -> queue item & file cleaned up
+    storageQueueFail.failDeleteFor(uploadedPath, false);
+    const summary = await envGeminiQueue.retentionService.cleanupExpiredAudio({
+      includeOrphans: false,
+    });
+    assert.equal(summary.queueScanned, 1);
+    assert.equal(summary.queueDeleted, 1);
+    assert.equal(storageQueueFail.objects.size, 0);
+    assert.equal(Object.keys(envGeminiQueue.dbController.docs.audio_cleanup_queue || {}).length, 0);
+  });
+
+  // 8c. DELETE /api/songs/:songId when Storage delete fails preserves song doc, queues retry, and completes on retry
+  const storageSongDel = createInMemoryAudioStorage();
+  const songDelPath = 'organizations/org_a/audio/song-del-fail-1.mp3';
+  storageSongDel.seedObject(songDelPath, {
+    organizationId: 'org_a',
+    ownerId: 'uid_prom_a',
+    uploadedAt: '2026-01-01T00:00:00.000Z',
+  });
+  storageSongDel.failDeleteFor(songDelPath, true);
+
+  const envSongDel = buildTestEnvironment({ audioStorage: storageSongDel });
+  await envSongDel.dbController.adapter.setDoc('songs', 'song_retry_del', {
+    id: 'song_retry_del',
+    organizationId: 'org_a',
+    ownerId: 'uid_prom_a',
+    assignedUserIds: ['uid_prom_a'],
+    title: 'Cannot Delete Storage Yet',
+    audioStoragePath: songDelPath,
+    audioStorageCleanupStatus: 'active',
+  });
+
+  await withLiveServer(envSongDel.app, async (baseUrl) => {
+    const failedDel = await fetch(`${baseUrl}/api/songs/song_retry_del`, {
+      method: 'DELETE',
+      headers: { Authorization: 'Bearer token-promoter-a' },
+    });
+    assert.equal(failedDel.status, 502);
+    const failedBody = (await failedDel.json()) as {
+      ok: boolean;
+      deleted: boolean;
+      cleanupQueued: boolean;
+    };
+    assert.equal(failedBody.ok, false);
+    assert.equal(failedBody.deleted, false);
+    assert.equal(failedBody.cleanupQueued, true);
+
+    // Database doc MUST still exist with cleanup_failed status and durable queue entry!
+    assert.ok(envSongDel.dbController.docs.songs.song_retry_del);
+    assert.equal(
+      envSongDel.dbController.docs.songs.song_retry_del.audioStorageCleanupStatus,
+      'cleanup_failed'
+    );
+    const qItems = Object.values(envSongDel.dbController.docs.audio_cleanup_queue || {});
+    assert.equal(qItems.length, 1);
+    assert.equal(qItems[0].songId, 'song_retry_del');
+    assert.equal(qItems[0].deleteSongOnCleanup, true);
+
+    // Storage recovers -> retry cleanup completes Storage deletion AND removes song doc
+    storageSongDel.failDeleteFor(songDelPath, false);
+    const retrySummary = await envSongDel.retentionService.cleanupExpiredAudio({
+      includeOrphans: false,
+    });
+    assert.equal(retrySummary.queueDeleted, 1);
+    assert.equal(storageSongDel.objects.has(songDelPath), false);
+    assert.equal(envSongDel.dbController.docs.songs.song_retry_del, undefined);
+    assert.equal(Object.keys(envSongDel.dbController.docs.audio_cleanup_queue || {}).length, 0);
+  });
+
+  // 8d. Orphaned Storage object reconciliation respects grace period, active songs, and strictly isolates organizations
+  const storageOrphan = createInMemoryAudioStorage();
+  const now = new Date('2026-05-01T12:00:00.000Z');
+  const twoHoursAgo = '2026-05-01T10:00:00.000Z';
+  const fiveMinsAgo = '2026-05-01T11:55:00.000Z';
+
+  const orphanOldA = 'organizations/org_a/audio/orphan-old-a.mp3';
+  const orphanFreshA = 'organizations/org_a/audio/orphan-fresh-a.mp3';
+  const activeOldA = 'organizations/org_a/audio/active-old-a.mp3';
+  const orphanOldB = 'organizations/org_b/audio/orphan-old-b.mp3';
+  const mismatchedMetaA = 'organizations/org_a/audio/cross-meta-a.mp3';
+
+  storageOrphan.seedObject(orphanOldA, { organizationId: 'org_a', uploadedAt: twoHoursAgo });
+  storageOrphan.seedObject(orphanFreshA, { organizationId: 'org_a', uploadedAt: fiveMinsAgo });
+  storageOrphan.seedObject(activeOldA, { organizationId: 'org_a', uploadedAt: twoHoursAgo });
+  storageOrphan.seedObject(orphanOldB, { organizationId: 'org_b', uploadedAt: twoHoursAgo });
+  // Cross-org metadata mismatch must be skipped safely!
+  storageOrphan.seedObject(mismatchedMetaA, { organizationId: 'org_b', uploadedAt: twoHoursAgo });
+
+  const envOrphan = buildTestEnvironment({ audioStorage: storageOrphan });
+  await envOrphan.dbController.adapter.setDoc('songs', 'song_active_ref', {
+    id: 'song_active_ref',
+    organizationId: 'org_a',
+    ownerId: 'uid_prom_a',
+    assignedUserIds: ['uid_prom_a'],
+    title: 'Active Referenced Song',
+    audioStoragePath: activeOldA,
+    audioStorageCleanupStatus: 'active',
+    audioRetentionExpiresAt: '2026-08-01T00:00:00.000Z',
+  });
+
+  // Scoped cleanup for org_a ONLY deletes orphanOldA; org_b's orphanOldB, activeOldA, orphanFreshA, and mismatchedMetaA stay untouched!
+  const orphanSummaryA = await envOrphan.retentionService.cleanupExpiredAudio({
+    now,
+    includeOrphans: true,
+    orphanGraceMinutes: 60,
+    organizationId: 'org_a',
+  });
+
+  assert.equal(orphanSummaryA.orphansDeleted, 1);
+  assert.equal(storageOrphan.objects.has(orphanOldA), false);
+  assert.equal(storageOrphan.objects.has(orphanFreshA), true);
+  assert.equal(storageOrphan.objects.has(activeOldA), true);
+  assert.equal(storageOrphan.objects.has(orphanOldB), true);
+  assert.equal(storageOrphan.objects.has(mismatchedMetaA), true);
+});
+

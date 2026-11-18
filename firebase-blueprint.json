@@ -563,7 +563,7 @@
     },
     "AudioCleanupLog": {
       "title": "AudioCleanupLog",
-      "description": "Server-managed log of retention cleanup attempts on expired private audio files",
+      "description": "Server-managed log of retention cleanup attempts on expired or orphaned private audio files",
       "type": "object",
       "properties": {
         "id": { "type": "string", "maxLength": 128 },
@@ -571,12 +571,32 @@
         "organizationId": { "type": "string", "maxLength": 128 },
         "storageObjectPath": { "type": "string", "maxLength": 512 },
         "status": { "type": "string", "enum": ["deleted", "failed"] },
+        "reason": { "type": "string", "enum": ["gemini_analysis_failed", "song_delete_failed", "orphan_reconciled", "retention_expired"] },
         "error": { "type": "string", "maxLength": 400 },
         "attemptedAt": { "type": "string", "maxLength": 40 },
         "createdAt": { "type": "string", "maxLength": 40 },
         "updatedAt": { "type": "string", "maxLength": 40 }
       },
       "required": ["id", "songId", "organizationId", "storageObjectPath", "status", "attemptedAt", "createdAt", "updatedAt"]
+    },
+    "AudioCleanupQueueItem": {
+      "title": "AudioCleanupQueueItem",
+      "description": "Server-managed durable retry queue for failed audio storage deletions and orphan reconciliations",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "storageObjectPath": { "type": "string", "maxLength": 512 },
+        "organizationId": { "type": "string", "maxLength": 128 },
+        "songId": { "type": "string", "maxLength": 128 },
+        "deleteSongOnCleanup": { "type": "boolean" },
+        "reason": { "type": "string", "enum": ["gemini_analysis_failed", "song_delete_failed", "orphan_reconciled", "retention_expired"] },
+        "status": { "type": "string", "enum": ["pending", "failed"] },
+        "retryCount": { "type": "number" },
+        "lastError": { "type": "string", "maxLength": 400 },
+        "createdAt": { "type": "string", "maxLength": 40 },
+        "updatedAt": { "type": "string", "maxLength": 40 }
+      },
+      "required": ["id", "storageObjectPath", "organizationId", "reason", "status", "retryCount", "createdAt", "updatedAt"]
     }
   },
   "firestore": {
@@ -604,6 +624,7 @@
     "/payment_reference_bindings/{bindingId}": { "schema": { "$ref": "#/entities/PaymentReferenceBinding" }, "description": "Server-managed payment reference uniqueness bindings" },
     "/payment_webhook_events/{eventId}": { "schema": { "$ref": "#/entities/PaymentWebhookEvent" }, "description": "Server-managed webhook idempotency and retry ledger" },
     "/ai_rate_limits/{limitId}": { "schema": { "$ref": "#/entities/AiRateLimitBucket" }, "description": "Server-managed distributed AI rate-limit counters" },
-    "/audio_cleanup_logs/{logId}": { "schema": { "$ref": "#/entities/AudioCleanupLog" }, "description": "Server-managed retention cleanup logs" }
+    "/audio_cleanup_logs/{logId}": { "schema": { "$ref": "#/entities/AudioCleanupLog" }, "description": "Server-managed retention cleanup logs" },
+    "/audio_cleanup_queue/{itemId}": { "schema": { "$ref": "#/entities/AudioCleanupQueueItem" }, "description": "Server-managed durable retry queue for failed audio storage deletions" }
   }
 }

@@ -245,6 +245,7 @@ export class FirestorePaymentRepository {
         expectedAmountMinor: expectedMinor,
         expectedCurrency: params.invoiceCurrency,
         invoiceId: params.invoiceId,
+        expectedOrganizationId: params.invoiceOrganizationId,
         fetchImpl: this.fetchImpl,
       });
     } else if (params.provider === 'flutterwave') {
@@ -254,6 +255,7 @@ export class FirestorePaymentRepository {
         expectedAmountMinor: expectedMinor,
         expectedCurrency: params.invoiceCurrency,
         invoiceId: params.invoiceId,
+        expectedOrganizationId: params.invoiceOrganizationId,
         fetchImpl: this.fetchImpl,
       });
     } else if (params.provider === 'stripe') {
@@ -262,6 +264,7 @@ export class FirestorePaymentRepository {
         expectedAmountMinor: expectedMinor,
         expectedCurrency: params.invoiceCurrency,
         invoiceId: params.invoiceId,
+        expectedOrganizationId: params.invoiceOrganizationId,
         stripeClient: this.stripeClient,
       });
     } else {
@@ -286,11 +289,22 @@ export class FirestorePaymentRepository {
 
     let invoiceReconciled = false;
     await this.db.runTransaction(async (tx) => {
+      // READ PHASE: Execute all tx.get calls before any tx.set or tx.update calls
       const existing = await tx.get('payment_reference_bindings', bindingDocId);
-      if (existing && (existing.invoiceId !== params.invoiceId || existing.organizationId !== params.invoiceOrganizationId)) {
+      if (
+        existing &&
+        (existing.invoiceId !== params.invoiceId ||
+          existing.organizationId !== params.invoiceOrganizationId)
+      ) {
         throw new ReferenceConflictError('Payment reference conflict detected during persistence.');
       }
 
+      const inv =
+        result.verified && params.isSuperAdmin
+          ? await tx.get('invoices', params.invoiceId)
+          : null;
+
+      // WRITE PHASE
       await tx.set(
         'payment_reference_bindings',
         bindingDocId,
@@ -314,17 +328,14 @@ export class FirestorePaymentRepository {
         true
       );
 
-      if (result.verified && params.isSuperAdmin) {
-        const inv = await tx.get('invoices', params.invoiceId);
-        if (inv && inv.status !== 'paid' && inv.status !== 'refunded' && inv.status !== 'void') {
-          await tx.update('invoices', params.invoiceId, {
-            status: 'paid',
-            verifiedPaymentRef: params.reference,
-            paidAt: nowIso,
-            updatedAt: SERVER_TIMESTAMP_SENTINEL,
-          });
-          invoiceReconciled = true;
-        }
+      if (inv && inv.status !== 'paid' && inv.status !== 'refunded' && inv.status !== 'void') {
+        await tx.update('invoices', params.invoiceId, {
+          status: 'paid',
+          verifiedPaymentRef: params.reference,
+          paidAt: nowIso,
+          updatedAt: SERVER_TIMESTAMP_SENTINEL,
+        });
+        invoiceReconciled = true;
       }
     });
 
@@ -351,7 +362,32 @@ export class FirestorePaymentRepository {
     const bindingDocId = makeBindingDocId(params.provider, params.reference);
     const nowIso = new Date().toISOString();
 
+    const queriedPayments = await this.db
+      .queryDocs(
+        'payments',
+        [{ field: 'reference', op: '==', value: params.reference }],
+        { limit: 10 }
+      )
+      .catch(() => []);
+
+    const candidatePaymentIds = Array.from(
+      new Set(
+        [
+          ...(params.paymentId ? [params.paymentId] : []),
+          ...queriedPayments
+            .filter(
+              (p) =>
+                p.provider === params.provider &&
+                p.invoiceId === params.invoiceId &&
+                typeof p.id === 'string'
+            )
+            .map((p) => String(p.id)),
+        ].filter(Boolean)
+      )
+    );
+
     return this.db.runTransaction(async (tx) => {
+      // READ PHASE: All tx.get calls must complete strictly before any writes
       const binding = await tx.get('payment_reference_bindings', bindingDocId);
       if (!binding || binding.invoiceId !== params.invoiceId) {
         throw new Error('BINDING_NOT_FOUND');
@@ -366,37 +402,54 @@ export class FirestorePaymentRepository {
       if (!invoice) {
         throw new Error('INVOICE_NOT_FOUND');
       }
+      if (
+        typeof binding.organizationId === 'string' &&
+        typeof invoice.organizationId === 'string' &&
+        binding.organizationId !== invoice.organizationId
+      ) {
+        throw new ReferenceConflictError('Binding organization does not match invoice organization.');
+      }
 
+      const paymentsToUpdate: string[] = [];
+      for (const pmId of candidatePaymentIds) {
+        const paymentDoc = await tx.get('payments', pmId);
+        if (!paymentDoc) continue;
+        if (
+          paymentDoc.invoiceId !== params.invoiceId ||
+          paymentDoc.provider !== params.provider ||
+          paymentDoc.reference !== params.reference
+        ) {
+          if (pmId === params.paymentId) {
+            throw new ReferenceConflictError(
+              'Payment record does not match bound invoice/reference.'
+            );
+          }
+          continue;
+        }
+        paymentsToUpdate.push(pmId);
+      }
+
+      // WRITE PHASE
       const targetInvoiceStatus =
         status === 'verified' ? 'paid' : status === 'refunded' ? 'refunded' : 'disputed';
 
       await tx.update('invoices', params.invoiceId, {
         status: targetInvoiceStatus,
         verifiedPaymentRef: params.reference,
-        ...(targetInvoiceStatus === 'paid' ? { paidAt: nowIso } : {}),
+        ...(targetInvoiceStatus === 'paid' && !invoice.paidAt ? { paidAt: nowIso } : {}),
         updatedAt: SERVER_TIMESTAMP_SENTINEL,
       });
 
-      if (params.paymentId) {
-        const paymentDoc = await tx.get('payments', params.paymentId);
-        if (paymentDoc) {
-          if (
-            paymentDoc.invoiceId !== params.invoiceId ||
-            paymentDoc.provider !== params.provider ||
-            paymentDoc.reference !== params.reference
-          ) {
-            throw new ReferenceConflictError('Payment record does not match bound invoice/reference.');
-          }
-          await tx.update('payments', params.paymentId, {
-            verificationStatus: status,
-            verificationSource: 'server_api',
-            verifiedAt: nowIso,
-            ...(binding.providerTransactionId
-              ? { providerTransactionId: binding.providerTransactionId }
-              : {}),
-            updatedAt: SERVER_TIMESTAMP_SENTINEL,
-          });
-        }
+      for (const pmId of paymentsToUpdate) {
+        await tx.update('payments', pmId, {
+          verificationStatus: status,
+          verificationSource: 'server_api',
+          verifiedAt: nowIso,
+          ...(binding.providerTransactionId
+            ? { providerTransactionId: binding.providerTransactionId }
+            : {}),
+          updatedAt: SERVER_TIMESTAMP_SENTINEL,
+        });
       }
 
       return {
@@ -446,24 +499,56 @@ export class FirestorePaymentRepository {
         : 0;
 
     // Step 2: Resolve bound reference / invoice / payments from Firestore
-    const bindingDocId = normalized.reference
+    let bindingDocId = normalized.reference
       ? makeBindingDocId(provider, normalized.reference)
       : '';
-    const existingBinding = bindingDocId
+    let existingBinding = bindingDocId
       ? await this.db.getDoc('payment_reference_bindings', bindingDocId)
       : null;
 
-    const matchingPayments = normalized.reference
-      ? await this.db
-          .queryDocs(
-            'payments',
-            [{ field: 'reference', op: '==', value: normalized.reference }],
-            { limit: 10 }
-          )
-          .catch(() => [])
-      : [];
+    if (!existingBinding && normalized.providerTransactionId) {
+      const txBindings = await this.db
+        .queryDocs(
+          'payment_reference_bindings',
+          [{ field: 'providerTransactionId', op: '==', value: normalized.providerTransactionId }],
+          { limit: 5 }
+        )
+        .catch(() => []);
+      const providerBinding = txBindings.find((b) => b.provider === provider);
+      if (providerBinding && typeof providerBinding.id === 'string') {
+        existingBinding = providerBinding;
+        bindingDocId = providerBinding.id;
+      }
+    }
 
-    const providerMatchedPayments = matchingPayments.filter((p) => p.provider === provider);
+    const [matchingByRef, matchingByTxId] = await Promise.all([
+      normalized.reference
+        ? this.db
+            .queryDocs(
+              'payments',
+              [{ field: 'reference', op: '==', value: normalized.reference }],
+              { limit: 10 }
+            )
+            .catch(() => [])
+        : Promise.resolve([]),
+      normalized.providerTransactionId
+        ? this.db
+            .queryDocs(
+              'payments',
+              [{ field: 'providerTransactionId', op: '==', value: normalized.providerTransactionId }],
+              { limit: 10 }
+            )
+            .catch(() => [])
+        : Promise.resolve([]),
+    ]);
+
+    const providerMatchedMap = new Map<string, Record<string, unknown>>();
+    for (const p of [...matchingByRef, ...matchingByTxId]) {
+      if (p.provider === provider && typeof p.id === 'string') {
+        providerMatchedMap.set(p.id, p);
+      }
+    }
+    const providerMatchedPayments = Array.from(providerMatchedMap.values());
 
     const resolvedInvoiceId =
       (existingBinding?.invoiceId as string | undefined) ||
@@ -533,9 +618,38 @@ export class FirestorePaymentRepository {
     const invoiceAmount = Number(invoice.amount || 0);
     const expectedMinor = toMinorUnits(invoiceAmount, invoiceCurrency);
 
+    if (expectedMinor <= 0) {
+      const quarantineReason = 'Referenced invoice has an invalid non-positive amount.';
+      await this.persistQuarantinedWebhook({
+        eventDocId,
+        provider,
+        normalized,
+        invoiceId: resolvedInvoiceId,
+        organizationId: invoiceOrgId,
+        outcome: 'failed',
+        quarantineReason,
+        retryCount: prevRetryCount,
+        nowIso,
+      });
+      return {
+        received: true,
+        duplicate: false,
+        quarantined: true,
+        retryable: false,
+        provider,
+        eventId: normalized.eventId,
+        eventDocId,
+        outcome: 'failed',
+        reconciliationStatus: 'quarantined',
+        invoiceId: resolvedInvoiceId,
+        note: quarantineReason,
+      };
+    }
+
     // Step 3: Validate cross-org & reference reuse consistency
     if (normalized.organizationId && normalized.organizationId !== invoiceOrgId) {
-      const quarantineReason = 'Webhook metadata organizationId does not match authoritative invoice organization.';
+      const quarantineReason =
+        'Webhook metadata organizationId does not match authoritative invoice organization.';
       await this.persistQuarantinedWebhook({
         eventDocId,
         provider,
@@ -593,13 +707,47 @@ export class FirestorePaymentRepository {
       };
     }
 
-    // Step 4: Validate webhook amount & currency before trusting settlement
+    // Step 4: Validate webhook amount & currency completeness and accuracy before trusting settlement
     if (
       normalized.outcome === 'verified' &&
-      ((normalized.amountMinor !== undefined && normalized.amountMinor !== expectedMinor) ||
-        (normalized.currency && normalized.currency.toUpperCase() !== invoiceCurrency))
+      (normalized.amountMinor === undefined ||
+        !normalized.currency ||
+        normalized.amountMinor !== expectedMinor ||
+        normalized.currency.toUpperCase() !== invoiceCurrency)
     ) {
-      const quarantineReason = `Webhook amount/currency mismatch against invoice (${expectedMinor} ${invoiceCurrency}).`;
+      const quarantineReason = `Webhook amount/currency missing or mismatched against invoice (${expectedMinor} ${invoiceCurrency}).`;
+      await this.persistQuarantinedWebhook({
+        eventDocId,
+        provider,
+        normalized,
+        invoiceId: resolvedInvoiceId,
+        organizationId: invoiceOrgId,
+        outcome: 'failed',
+        quarantineReason,
+        retryCount: prevRetryCount,
+        nowIso,
+      });
+      return {
+        received: true,
+        duplicate: false,
+        quarantined: true,
+        retryable: false,
+        provider,
+        eventId: normalized.eventId,
+        eventDocId,
+        outcome: 'failed',
+        reconciliationStatus: 'quarantined',
+        invoiceId: resolvedInvoiceId,
+        note: quarantineReason,
+      };
+    }
+
+    if (
+      (normalized.outcome === 'refunded' || normalized.outcome === 'disputed') &&
+      normalized.currency &&
+      normalized.currency.toUpperCase() !== invoiceCurrency
+    ) {
+      const quarantineReason = `Webhook currency (${normalized.currency}) does not match invoice currency (${invoiceCurrency}).`;
       await this.persistQuarantinedWebhook({
         eventDocId,
         provider,
@@ -627,7 +775,7 @@ export class FirestorePaymentRepository {
     }
 
     // Step 5: Authoritative Provider Verification API confirmation for verified settlements
-    let finalOutcome: PaymentVerificationStatus = normalized.outcome;
+    const finalOutcome: PaymentVerificationStatus = normalized.outcome;
     let verifiedTxId = normalized.providerTransactionId;
     let note = `Processed ${provider} ${normalized.eventType} event.`;
 
@@ -639,6 +787,7 @@ export class FirestorePaymentRepository {
           expectedAmountMinor: expectedMinor,
           expectedCurrency: invoiceCurrency,
           invoiceId: resolvedInvoiceId,
+          expectedOrganizationId: invoiceOrgId,
           fetchImpl: this.fetchImpl,
         });
       } else if (provider === 'flutterwave') {
@@ -648,6 +797,7 @@ export class FirestorePaymentRepository {
           expectedAmountMinor: expectedMinor,
           expectedCurrency: invoiceCurrency,
           invoiceId: resolvedInvoiceId,
+          expectedOrganizationId: invoiceOrgId,
           fetchImpl: this.fetchImpl,
         });
       } else if (provider === 'stripe') {
@@ -656,6 +806,7 @@ export class FirestorePaymentRepository {
           expectedAmountMinor: expectedMinor,
           expectedCurrency: invoiceCurrency,
           invoiceId: resolvedInvoiceId,
+          expectedOrganizationId: invoiceOrgId,
           stripeClient: this.stripeClient,
         });
       }
@@ -696,11 +847,16 @@ export class FirestorePaymentRepository {
     }
 
     // Step 6: Atomic Firestore reconciliation transaction
+    const effectiveReference =
+      typeof existingBinding?.reference === 'string' && existingBinding.reference
+        ? existingBinding.reference
+        : normalized.reference;
+
     const serverAttestation = signPaymentAttestation({
       invoiceId: resolvedInvoiceId,
       organizationId: invoiceOrgId,
       provider,
-      reference: normalized.reference,
+      reference: effectiveReference,
       amountMinor: expectedMinor,
       currency: invoiceCurrency,
       verificationStatus: finalOutcome,
@@ -708,6 +864,7 @@ export class FirestorePaymentRepository {
 
     try {
       const txResult = await this.db.runTransaction(async (tx) => {
+        // READ PHASE: Perform ALL tx.get calls before ANY tx.set or tx.update calls
         const txWebhook = await tx.get('payment_webhook_events', eventDocId);
         if (
           txWebhook &&
@@ -727,22 +884,46 @@ export class FirestorePaymentRepository {
           throw new Error('INVOICE_MISSING_IN_TX');
         }
 
+        const txBinding = bindingDocId
+          ? await tx.get('payment_reference_bindings', bindingDocId)
+          : null;
+        if (
+          txBinding &&
+          (txBinding.invoiceId !== resolvedInvoiceId || txBinding.organizationId !== invoiceOrgId)
+        ) {
+          throw new ReferenceConflictError('Payment reference bound to conflicting invoice.');
+        }
+
+        const livePaymentIdsToUpdate: string[] = [];
+        for (const pm of providerMatchedPayments) {
+          const pmId = String(pm.id || '');
+          if (!pmId) continue;
+          const livePm = await tx.get('payments', pmId);
+          if (!livePm || livePm.invoiceId !== resolvedInvoiceId) continue;
+          livePaymentIdsToUpdate.push(pmId);
+        }
+
+        const shouldCreateCanonicalPayment =
+          livePaymentIdsToUpdate.length === 0 &&
+          (finalOutcome === 'verified' ||
+            finalOutcome === 'failed' ||
+            finalOutcome === 'refunded' ||
+            finalOutcome === 'disputed');
+        const canonicalPayId = `pay_wh_${eventDocId.slice(0, 32)}`;
+        const existingCanonical = shouldCreateCanonicalPayment
+          ? await tx.get('payments', canonicalPayId)
+          : null;
+
+        // WRITE PHASE: All reads are complete
         if (bindingDocId) {
-          const txBinding = await tx.get('payment_reference_bindings', bindingDocId);
-          if (
-            txBinding &&
-            (txBinding.invoiceId !== resolvedInvoiceId || txBinding.organizationId !== invoiceOrgId)
-          ) {
-            throw new ReferenceConflictError('Payment reference bound to conflicting invoice.');
-          }
           await tx.set(
             'payment_reference_bindings',
             bindingDocId,
             {
               id: bindingDocId,
-              bindingKey: `${provider}:${normalized.reference}`,
+              bindingKey: `${provider}:${effectiveReference}`,
               provider,
-              reference: normalized.reference,
+              reference: effectiveReference,
               invoiceId: resolvedInvoiceId,
               organizationId: invoiceOrgId,
               currency: invoiceCurrency,
@@ -757,13 +938,16 @@ export class FirestorePaymentRepository {
           );
         }
 
-        // Update invoice state atomically based on verified/failed/refunded/disputed outcome
         const currentInvStatus = String(txInvoice.status || 'sent');
         if (finalOutcome === 'verified') {
-          if (currentInvStatus !== 'refunded' && currentInvStatus !== 'disputed' && currentInvStatus !== 'void') {
+          if (
+            currentInvStatus !== 'refunded' &&
+            currentInvStatus !== 'disputed' &&
+            currentInvStatus !== 'void'
+          ) {
             await tx.update('invoices', resolvedInvoiceId, {
               status: 'paid',
-              verifiedPaymentRef: normalized.reference,
+              verifiedPaymentRef: effectiveReference,
               paidAt: txInvoice.paidAt || nowIso,
               updatedAt: SERVER_TIMESTAMP_SENTINEL,
             });
@@ -771,13 +955,13 @@ export class FirestorePaymentRepository {
         } else if (finalOutcome === 'refunded') {
           await tx.update('invoices', resolvedInvoiceId, {
             status: 'refunded',
-            verifiedPaymentRef: normalized.reference,
+            verifiedPaymentRef: effectiveReference,
             updatedAt: SERVER_TIMESTAMP_SENTINEL,
           });
         } else if (finalOutcome === 'disputed') {
           await tx.update('invoices', resolvedInvoiceId, {
             status: 'disputed',
-            verifiedPaymentRef: normalized.reference,
+            verifiedPaymentRef: effectiveReference,
             updatedAt: SERVER_TIMESTAMP_SENTINEL,
           });
         } else if (finalOutcome === 'failed' && currentInvStatus === 'awaiting_verification') {
@@ -787,32 +971,22 @@ export class FirestorePaymentRepository {
           });
         }
 
-        // Update matching payment docs inside transaction, or create canonical payment doc if absent
-        if (providerMatchedPayments.length > 0) {
-          for (const pm of providerMatchedPayments) {
-            const pmId = String(pm.id || '');
-            if (!pmId) continue;
-            const livePm = await tx.get('payments', pmId);
-            if (!livePm || livePm.invoiceId !== resolvedInvoiceId) continue;
+        if (livePaymentIdsToUpdate.length > 0) {
+          for (const pmId of livePaymentIdsToUpdate) {
             await tx.update('payments', pmId, {
               verificationStatus: finalOutcome,
               verificationSource: 'webhook',
               webhookEventId: eventDocId,
               ...(verifiedTxId ? { providerTransactionId: verifiedTxId } : {}),
               ...(finalOutcome === 'verified' ? { verifiedAt: nowIso } : {}),
-              ...(normalized.failureReason ? { failureReason: normalized.failureReason.slice(0, 380) } : {}),
+              ...(normalized.failureReason
+                ? { failureReason: normalized.failureReason.slice(0, 380) }
+                : {}),
               serverAttestation,
               updatedAt: SERVER_TIMESTAMP_SENTINEL,
             });
           }
-        } else if (
-          finalOutcome === 'verified' ||
-          finalOutcome === 'failed' ||
-          finalOutcome === 'refunded' ||
-          finalOutcome === 'disputed'
-        ) {
-          const canonicalPayId = `pay_wh_${eventDocId.slice(0, 32)}`;
-          const existingCanonical = await tx.get('payments', canonicalPayId);
+        } else if (shouldCreateCanonicalPayment) {
           const ownerId = String(txInvoice.ownerId || 'system');
           const assignedUserIds = Array.isArray(txInvoice.assignedUserIds)
             ? (txInvoice.assignedUserIds as string[])
@@ -827,7 +1001,7 @@ export class FirestorePaymentRepository {
               assignedUserIds,
               invoiceId: resolvedInvoiceId,
               provider,
-              reference: normalized.reference,
+              reference: effectiveReference,
               ...(verifiedTxId ? { providerTransactionId: verifiedTxId } : {}),
               currency: invoiceCurrency,
               amount: invoiceAmount,
@@ -835,7 +1009,9 @@ export class FirestorePaymentRepository {
               verificationSource: 'webhook',
               webhookEventId: eventDocId,
               ...(finalOutcome === 'verified' ? { verifiedAt: nowIso } : {}),
-              ...(normalized.failureReason ? { failureReason: normalized.failureReason.slice(0, 380) } : {}),
+              ...(normalized.failureReason
+                ? { failureReason: normalized.failureReason.slice(0, 380) }
+                : {}),
               serverAttestation,
               createdAt: existingCanonical?.createdAt || SERVER_TIMESTAMP_SENTINEL,
               updatedAt: SERVER_TIMESTAMP_SENTINEL,
@@ -853,7 +1029,7 @@ export class FirestorePaymentRepository {
             provider,
             eventId: normalized.eventId,
             eventType: normalized.eventType,
-            reference: normalized.reference,
+            reference: effectiveReference,
             ...(verifiedTxId ? { providerTransactionId: verifiedTxId } : {}),
             invoiceId: resolvedInvoiceId,
             organizationId: invoiceOrgId,

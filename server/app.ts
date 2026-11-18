@@ -33,6 +33,7 @@ import {
 import {
   AudioRetentionService,
   createFirebaseAdminAudioStorage,
+  parseAudioOrgFromPath,
   type AudioStorageAdapter,
 } from './audioStorage.ts';
 import {
@@ -256,7 +257,12 @@ export function createSonicPushApp(deps: SonicPushAppDeps = {}): Express {
     let claimsSynced = !s.needsTokenRefresh;
 
     if (s.isSuperAdmin && s.needsTokenRefresh) {
-      const syncResult = await syncRoleCustomClaims(s.uid, 'SUPER_ADMIN', adminAuth);
+      const syncResult = await syncRoleCustomClaims(
+        s.uid,
+        'SUPER_ADMIN',
+        adminAuth,
+        s.organizationId || undefined
+      );
       claimsSynced = syncResult.synced;
     }
 
@@ -278,7 +284,12 @@ export function createSonicPushApp(deps: SonicPushAppDeps = {}): Express {
   app.post('/api/auth/refresh-claims', verifyFirebaseAuth, async (req: AuthenticatedRequest, res: Response) => {
     const s = req.authSession!;
     const targetRole: UserRole = s.role || 'ARTIST';
-    const syncResult = await syncRoleCustomClaims(s.uid, targetRole, adminAuth);
+    const syncResult = await syncRoleCustomClaims(
+      s.uid,
+      targetRole,
+      adminAuth,
+      s.organizationId || undefined
+    );
     res.json({
       ok: syncResult.synced,
       role: targetRole,
@@ -390,8 +401,12 @@ export function createSonicPushApp(deps: SonicPushAppDeps = {}): Express {
           );
         }
 
-        // Sync Firebase Auth custom claims so Firestore & Storage `allow list` / admin rules match immediately upon token refresh
-        const claimSync = await syncRoleCustomClaims(targetUid, nextRole, adminAuth);
+        // Sync Firebase Auth custom claims so Firestore & Storage `allow list` / org rules match immediately upon token refresh
+        const targetOrgId =
+          typeof targetDoc.organizationId === 'string' && targetDoc.organizationId
+            ? targetDoc.organizationId
+            : undefined;
+        const claimSync = await syncRoleCustomClaims(targetUid, nextRole, adminAuth, targetOrgId);
 
         // Server-side immutable admin audit log
         const auditId = `audit_srv_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
@@ -442,20 +457,27 @@ export function createSonicPushApp(deps: SonicPushAppDeps = {}): Express {
     requireRole(['SUPER_ADMIN']),
     async (_req: AuthenticatedRequest, res: Response) => {
       try {
-        const [firebaseAdmin, recentWebhooks, recentCleanupLogs, aiUsageMetrics, failedCleanupSongs] =
-          await Promise.all([
-            getAdminDiag(),
-            paymentRepo.listAdminDiagnosticsWebhooks(40).catch(() => []),
-            audioRetention.listRecentCleanupLogs(25),
-            rateLimiter.getAdminUsageMetrics().catch(() => null),
-            adminDb
-              .queryDocs(
-                'songs',
-                [{ field: 'audioStorageCleanupStatus', op: '==', value: 'cleanup_failed' }],
-                { limit: 50 }
-              )
-              .catch(() => []),
-          ]);
+        const [
+          firebaseAdmin,
+          recentWebhooks,
+          recentCleanupLogs,
+          aiUsageMetrics,
+          failedCleanupSongs,
+          pendingQueue,
+        ] = await Promise.all([
+          getAdminDiag(),
+          paymentRepo.listAdminDiagnosticsWebhooks(40).catch(() => []),
+          audioRetention.listRecentCleanupLogs(25),
+          rateLimiter.getAdminUsageMetrics().catch(() => null),
+          adminDb
+            .queryDocs(
+              'songs',
+              [{ field: 'audioStorageCleanupStatus', op: '==', value: 'cleanup_failed' }],
+              { limit: 50 }
+            )
+            .catch(() => []),
+          audioRetention.listPendingCleanupQueue(50),
+        ]);
 
         const pendingRetryCount = recentWebhooks.filter(
           (w) => w.reconciliationStatus === 'pending_retry'
@@ -484,6 +506,7 @@ export function createSonicPushApp(deps: SonicPushAppDeps = {}): Express {
           },
           audioCleanup: {
             failedSongsCount: failedCleanupSongs.length,
+            pendingQueueCount: pendingQueue.length,
             recentLogs: recentCleanupLogs,
           },
           aiQuota: {
@@ -524,7 +547,19 @@ export function createSonicPushApp(deps: SonicPushAppDeps = {}): Express {
 
     try {
       const limit = Number(req.body?.limit) || 50;
-      const summary = await audioRetention.cleanupExpiredAudio({ limit });
+      const includeOrphans = req.body?.includeOrphans !== false;
+      const orphanGraceMinutes =
+        typeof req.body?.orphanGraceMinutes === 'number' &&
+        Number.isFinite(req.body.orphanGraceMinutes)
+          ? req.body.orphanGraceMinutes
+          : undefined;
+      const organizationId = sanitizeTextField(req.body?.organizationId, 128) || undefined;
+      const summary = await audioRetention.cleanupExpiredAudio({
+        limit,
+        includeOrphans,
+        orphanGraceMinutes,
+        organizationId,
+      });
       res.json(summary);
     } catch (err) {
       logStructured('error', 'audio_cleanup_endpoint_failed', {
@@ -545,6 +580,16 @@ export function createSonicPushApp(deps: SonicPushAppDeps = {}): Express {
     async (req: AuthenticatedRequest, res: Response) => {
       const started = Date.now();
       const session = req.authSession!;
+      let audioUploaded = false;
+      let effectiveOrgId = session.organizationId || session.uid;
+      let audioDescriptor: {
+        storageObjectPath: string;
+        safeFilename: string;
+        retentionExpiresAt: string;
+        detectedFormat: string;
+        canonicalMimeType: string;
+      } | null = null;
+
       try {
         const body = (req.body || {}) as Record<string, unknown>;
         const title = sanitizeTextField(body.title, 180);
@@ -569,18 +614,10 @@ export function createSonicPushApp(deps: SonicPushAppDeps = {}): Express {
           return;
         }
 
-        const effectiveOrgId = requestedOrgId || session.organizationId || session.uid;
+        effectiveOrgId = requestedOrgId || session.organizationId || session.uid;
         const file = req.file;
         let audioProcessed = false;
-        let audioUploaded = false;
         let audioUploadedAt = '';
-        let audioDescriptor: {
-          storageObjectPath: string;
-          safeFilename: string;
-          retentionExpiresAt: string;
-          detectedFormat: string;
-          canonicalMimeType: string;
-        } | null = null;
 
         const parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> =
           [];
@@ -628,6 +665,8 @@ export function createSonicPushApp(deps: SonicPushAppDeps = {}): Express {
             res.status(502).json({
               error:
                 'Private audio storage upload failed. Verify Firebase Storage configuration and IAM permissions before retrying.',
+              audioProcessed: false,
+              audioUploaded: false,
             });
             return;
           }
@@ -752,10 +791,47 @@ CRITICAL HONESTY & GROUNDING RULES:
         if (req.file?.buffer) {
           req.file.buffer.fill(0);
         }
+
+        // Rollback or enqueue durable cleanup if audio was already uploaded before Gemini failed
+        let cleanupQueued = false;
+        if (audioUploaded && audioDescriptor?.storageObjectPath) {
+          const rollbackPath = audioDescriptor.storageObjectPath;
+          try {
+            await audioStorage.deleteAudioObject(rollbackPath);
+            await audioRetention.logCleanupAttempt({
+              songId: 'rollback_gemini_failed',
+              organizationId: effectiveOrgId,
+              storageObjectPath: rollbackPath,
+              status: 'deleted',
+              reason: 'gemini_analysis_failed',
+            });
+            logStructured('info', 'audio_upload_rolled_back_on_gemini_failure', {
+              orgId: effectiveOrgId,
+              storageObjectPath: rollbackPath,
+            });
+          } catch (cleanupErr) {
+            cleanupQueued = true;
+            logStructured('error', 'audio_rollback_failed_enqueueing', {
+              orgId: effectiveOrgId,
+              storageObjectPath: rollbackPath,
+              error: sanitizeErrorMessage(cleanupErr),
+            });
+            await audioRetention
+              .enqueueCleanupTask({
+                storageObjectPath: rollbackPath,
+                organizationId: effectiveOrgId,
+                deleteSongOnCleanup: false,
+                reason: 'gemini_analysis_failed',
+                error: cleanupErr,
+              })
+              .catch(() => null);
+          }
+        }
+
         const safeErr = formatSafeGeminiError(err, 'Failed to analyze song release.');
         void rateLimiter.recordUsageLog({
           uid: session.uid,
-          organizationId: session.organizationId || session.uid,
+          organizationId: effectiveOrgId,
           feature: 'song_intelligence',
           model: 'gemini-4-hydrogen',
           status: 'error',
@@ -764,9 +840,16 @@ CRITICAL HONESTY & GROUNDING RULES:
         logStructured('error', 'ai_song_intelligence_error', {
           uidPrefix: session.uid.slice(0, 8),
           status: safeErr.status,
+          cleanupQueued,
           latencyMs: Date.now() - started,
         });
-        res.status(safeErr.status).json({ error: safeErr.message, latencyMs: Date.now() - started });
+        res.status(safeErr.status).json({
+          error: safeErr.message,
+          audioProcessed: false,
+          audioUploaded: false,
+          cleanupQueued,
+          latencyMs: Date.now() - started,
+        });
       }
     }
   );
@@ -927,14 +1010,85 @@ CRITICAL HONESTY & GROUNDING RULES:
           return;
         }
 
+        const songOrg = typeof song.organizationId === 'string' ? song.organizationId : '';
         const storagePath = typeof song.audioStoragePath === 'string' ? song.audioStoragePath : '';
+
         if (storagePath && song.audioStorageCleanupStatus !== 'deleted') {
-          await audioStorage.deleteAudioObject(storagePath).catch(() => null);
+          const pathOrg = parseAudioOrgFromPath(storagePath);
+          if (!pathOrg || !songOrg || pathOrg !== songOrg) {
+            logStructured('warn', 'song_delete_cross_org_path_blocked', {
+              songId,
+              songOrg,
+              pathOrg,
+            });
+            res.status(403).json({
+              ok: false,
+              deleted: false,
+              error: 'Cross-organization storage deletion blocked.',
+            });
+            return;
+          }
+
+          try {
+            await audioStorage.deleteAudioObject(storagePath);
+          } catch (storageErr) {
+            const safeErr = sanitizeErrorMessage(
+              storageErr,
+              'Failed to delete private audio file from Storage.'
+            );
+            await adminDb
+              .updateDoc('songs', songId, {
+                audioStorageCleanupStatus: 'cleanup_failed',
+                audioCleanupError: safeErr.slice(0, 380),
+                updatedAt: SERVER_TIMESTAMP_SENTINEL,
+              })
+              .catch(() => null);
+
+            await audioRetention
+              .enqueueCleanupTask({
+                storageObjectPath: storagePath,
+                organizationId: songOrg,
+                songId,
+                deleteSongOnCleanup: true,
+                reason: 'song_delete_failed',
+                error: storageErr,
+              })
+              .catch(() => null);
+
+            logStructured('error', 'song_delete_storage_failed_preserved_db', {
+              songId,
+              orgId: songOrg,
+              error: safeErr,
+            });
+
+            res.status(502).json({
+              ok: false,
+              deleted: false,
+              cleanupQueued: true,
+              songId,
+              error:
+                'Private audio deletion failed in Storage. Database metadata was preserved and cleanup retry has been queued.',
+            });
+            return;
+          }
+
+          await audioRetention.logCleanupAttempt({
+            songId,
+            organizationId: songOrg,
+            storageObjectPath: storagePath,
+            status: 'deleted',
+            reason: 'song_delete_failed',
+          });
         }
+
         await adminDb.deleteDoc('songs', songId);
-        res.json({ ok: true, songId });
+        res.json({ ok: true, deleted: true, songId });
       } catch (err) {
-        res.status(500).json({ error: sanitizeErrorMessage(err, 'Failed to delete song.') });
+        res.status(500).json({
+          ok: false,
+          deleted: false,
+          error: sanitizeErrorMessage(err, 'Failed to delete song.'),
+        });
       }
     }
   );

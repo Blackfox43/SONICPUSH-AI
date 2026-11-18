@@ -119,13 +119,18 @@ export async function verifyFirebaseIdToken(idToken: string): Promise<VerifiedFi
 export async function syncRoleCustomClaims(
   uid: string,
   role: UserRole,
-  claimManager: AuthClaimManager
+  claimManager: AuthClaimManager,
+  organizationId?: string
 ): Promise<{ synced: boolean; reason?: string }> {
   try {
-    await claimManager.setCustomUserClaims(uid, {
+    const claims: Record<string, unknown> = {
       superAdmin: role === 'SUPER_ADMIN',
       role,
-    });
+    };
+    if (organizationId) {
+      claims.organizationId = organizationId;
+    }
+    await claimManager.setCustomUserClaims(uid, claims);
     return { synced: true };
   } catch (err) {
     if (isPermissionOrCredentialError(err)) {
